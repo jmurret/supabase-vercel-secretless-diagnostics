@@ -98,6 +98,16 @@ async function probeAccess(client) {
   );
 }
 
+async function dbWhoami(client) {
+  try {
+    const { data, error } = await client.rpc('whoami');
+    if (error) return { error_code: error.code || null, error: error.message || null };
+    return data;
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
 async function describeEndUser(req) {
   const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
   if (!match) return { present: false };
@@ -130,13 +140,20 @@ async function describeEndUser(req) {
     ...CLIENT_OPTIONS,
     global: { headers: { Authorization: `Bearer ${jwt}` } },
   });
-  result.access = await probeAccess(userClient);
+  [result.access, result.database_identity] = await Promise.all([
+    probeAccess(userClient),
+    dbWhoami(userClient),
+  ]);
   return result;
 }
 
 async function handleDiagnostics(req, res) {
   const server = resolveServerCredential(req);
-  const [serverAccess, endUser] = await Promise.all([probeAccess(server.client), describeEndUser(req)]);
+  const [serverAccess, serverDbIdentity, endUser] = await Promise.all([
+    probeAccess(server.client),
+    dbWhoami(server.client),
+    describeEndUser(req),
+  ]);
   let supabaseHost = null;
   try {
     supabaseHost = new URL(SUPABASE_URL).host;
@@ -149,7 +166,7 @@ async function handleDiagnostics(req, res) {
       vercel_region: process.env.VERCEL_REGION ?? null,
       supabase_url_host: supabaseHost,
     },
-    server_credential: { ...server.info, access: serverAccess },
+    server_credential: { ...server.info, access: serverAccess, database_identity: serverDbIdentity },
     end_user: endUser,
   };
   res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
