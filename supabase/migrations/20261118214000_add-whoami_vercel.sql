@@ -1,6 +1,6 @@
 -- Reports how Supabase/PostgREST resolved the caller's JWT into a database identity.
 -- SECURITY INVOKER so current_user reflects the role the request is actually running as.
-create or replace function public.whoami()
+create or replace function public.whoami_vercel()
 returns jsonb
 language sql
 stable
@@ -14,7 +14,12 @@ as $$
     'current_user', current_user,
     'session_user', session_user,
     'auth_role', auth.role(),
-    'auth_uid', auth.uid(),
+    -- auth.uid() casts sub to uuid, which fails for third-party subjects (e.g. Vercel OIDC).
+    'auth_uid', case
+      when (select c->>'sub' from claims) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        then auth.uid()
+    end,
+    'jwt_sub', (select c->>'sub' from claims),
     'jwt_claims', (
       select coalesce(jsonb_object_agg(key, value), '{}'::jsonb)
       from claims, jsonb_each(claims.c)
@@ -47,5 +52,6 @@ as $$
   );
 $$;
 
-revoke all on function public.whoami() from public;
-grant execute on function public.whoami() to anon, authenticated, service_role;
+revoke all on function public.whoami_vercel() from public;
+grant execute on function public.whoami_vercel() to anon, authenticated, service_role;
+

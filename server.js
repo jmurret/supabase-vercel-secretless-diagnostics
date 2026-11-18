@@ -16,14 +16,21 @@ function firstEnv(names) {
   return name ? { name, value: process.env[name] } : null;
 }
 
-function decodeJwt(token) {
+function decodeJwtPart(token, index) {
   try {
     const parts = token.split('.');
     if (parts.length !== 3) return null;
-    return JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    return JSON.parse(Buffer.from(parts[index], 'base64url').toString('utf8'));
   } catch {
     return null;
   }
+}
+
+const decodeJwt = (token) => decodeJwtPart(token, 1);
+
+function jwtHeader(token) {
+  const header = decodeJwtPart(token, 0);
+  return header ? { alg: header.alg ?? null, kid: header.kid ?? null, typ: header.typ ?? null } : null;
 }
 
 function safeClaims(payload) {
@@ -69,6 +76,7 @@ function resolveServerCredential(req) {
         auth_path: 'vercel_oidc',
         oidc_source: oidc.source,
         apikey_env_var: anonKey?.name ?? null,
+        jwt_header: jwtHeader(token),
         claims: safeClaims(decodeJwt(token)),
       },
     };
@@ -100,7 +108,7 @@ async function probeAccess(client) {
 
 async function dbWhoami(client) {
   try {
-    const { data, error } = await client.rpc('whoami');
+    const { data, error } = await client.rpc('whoami_vercel');
     if (error) return { error_code: error.code || null, error: error.message || null };
     return data;
   } catch (err) {
@@ -112,7 +120,7 @@ async function describeEndUser(req) {
   const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
   if (!match) return { present: false };
   const jwt = match[1].trim();
-  const result = { present: true, claims: safeClaims(decodeJwt(jwt)) };
+  const result = { present: true, jwt_header: jwtHeader(jwt), claims: safeClaims(decodeJwt(jwt)) };
 
   const key = firstEnv(ANON_KEY_ENV_VARS) || firstEnv(KEY_ENV_VARS);
   const authClient = createClient(SUPABASE_URL, key?.value, CLIENT_OPTIONS);
