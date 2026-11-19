@@ -1,7 +1,9 @@
 # supabase-hello-world
 ## `GET /api/diagnostics`
 
-Returns JSON (non-secret) describing the current auth context:
+Returns JSON (non-secret) shaped as `{ "data": {...}, "checks": {...} }`. Always HTTP 200.
+
+`data` describes the current auth context:
 
 - `server_credential` – how the server talks to Supabase:
   - `auth_path: "vercel_oidc_marketplace"` when a Vercel OIDC token is available
@@ -29,3 +31,35 @@ makes the actual access decisions.
 Set `MARKETPLACE_RESOURCE_ID` to the Supabase Marketplace resource ID. Don't send the raw Vercel
 OIDC token to Supabase directly — Supabase doesn't trust Vercel's signing keys and rejects it
 with `PGRST301` ("No suitable key or wrong key type").
+
+### `checks`
+
+[`checks.js`](./checks.js) validates `data` against the Vercel Marketplace OIDC (secretless) spec:
+
+```json
+{
+  "spec": "Vercel Marketplace OIDC (spec updated Nov 18)",
+  "summary": { "status": "fail", "passed": 19, "warned": 1, "failed": 1, "skipped": 3 },
+  "results": [
+    { "id": "resource_role", "group": "resource_token", "description": "...",
+      "status": "fail", "expected": "authenticated", "actual": null, "detail": "..." }
+  ]
+}
+```
+
+Each result is `pass`, `warn`, `fail` or `skip` (skipped because an earlier step failed).
+`summary.status` is the worst status present.
+
+| Group | Checks |
+|---|---|
+| `path` | `auth_path` (OIDC path in use), `no_static_secret` (warn if a service-role/secret key is set) |
+| `vercel_oidc` | `oidc_present`, `oidc_iss`, `oidc_alg_kid` (RS256 + kid), `oidc_not_expired`, `oidc_owner_project` |
+| `mint` | `mint_ok` (with hints for spec error codes such as `resource_oidc_not_enabled`) |
+| `resource_token` | `resource_alg_kid`, `resource_required_claims` (aud, sub, act, iat, nbf, exp), `resource_iss`, `resource_aud`, `resource_sub`, `resource_role`, `resource_act` (act.sub = deployment OIDC sub), `resource_environment`, `resource_time` (60 s tolerance), `resource_lifetime` (≤ 15 min), `resource_size` (≤ 4 KB), `resource_signature` (verified against `<iss>/jwks.json`) |
+| `database` | `db_accepted` (PGRST301 → add the issuer as a Custom OIDC third-party provider), `db_role`, `db_claims_match`, `db_no_rls_bypass` |
+
+Optional env vars for exact matches (otherwise the check only validates the format and warns):
+
+- `VERCEL_INTEGRATION_ID` (`oac_…`) → expected `iss` = `https://integrations.vercel.com/<id>`
+- `VERCEL_INTEGRATION_INSTALLATION_ID` (`icfg_…`) → expected `aud`
+- `SUPABASE_RESOURCE_ID` → expected `sub`
