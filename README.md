@@ -1,4 +1,18 @@
 # supabase-vercel-secretless-daignostics
+
+## Set up
+
+Use a Vercel project that has the Supabase Marketplace integration. Then do these steps:
+
+1. Link the project: `vercel link`.
+2. Run `pnpm run bootstrap`. The script is safe to run again. It does this:
+   - Sets `MARKETPLACE_RESOURCE_ID` to the Supabase resource that is connected to the linked project.
+   - Removes `SUPABASE_JWT_SECRET`, `SUPABASE_SECRET_KEY` and `SUPABASE_SERVICE_ROLE_KEY` from the project. Code that uses these static secrets stops working.
+   - Replaces `.env.local` with the Development variables. It warns if `POSTGRES_URL` is not set.
+   - Applies the files in `supabase/migrations` (`public.whoami_vercel()` and `public.countries`). It asks for a Supabase access token only when the schema is missing. The token is hidden and is not saved. You can set `SUPABASE_ACCESS_TOKEN` to skip the prompt.
+3. Run `pnpm run enable-jit`. The JIT checks need it until CTRL-2145 and CTRL-2146 are done. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
+4. Redeploy, so that existing deployments get the changes.
+
 ## `GET /`
 
 Dashboard ([`dashboard.js`](./dashboard.js)) that calls `/api/diagnostics` and lists every check, grouped,
@@ -96,9 +110,8 @@ The JIT checks need JIT access and SSL enforcement on the Supabase project. The 
 
 Until then, enable JIT by hand:
 
-1. Link the project: `vercel link`.
-2. Pull the variables: `vercel env pull .env.local`.
-3. Run `pnpm run enable-jit`.
+1. Do the steps in [Set up](#set-up) to link the project and pull `.env.local` (`pnpm run bootstrap`).
+2. Run `pnpm run enable-jit`.
 
 The script needs an experimental API token. It enables SSL enforcement, then JIT access, and waits until the change is applied. It is safe to run again.
 
