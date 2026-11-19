@@ -24,7 +24,7 @@ as $$
       select coalesce(jsonb_object_agg(key, value), '{}'::jsonb)
       from claims, jsonb_each(claims.c)
       where key in (
-        'iss', 'sub', 'aud', 'role', 'exp', 'iat', 'email', 'aal', 'is_anonymous', 'session_id',
+        'iss', 'sub', 'aud', 'role', 'exp', 'iat', 'nbf', 'email', 'aal', 'is_anonymous', 'session_id',
         'owner', 'owner_id', 'project', 'project_id', 'environment', 'act'
       )
     ),
