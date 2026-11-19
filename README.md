@@ -27,9 +27,11 @@ and deployable as a Vercel function). Returns JSON (non-secret) shaped as `{ "da
   - `auth_path: "vercel_integration_keys"` otherwise, showing which env var is used
     (`SUPABASE_SERVICE_ROLE_KEY` / `SUPABASE_ANON_KEY` / `NEXT_PUBLIC_SUPABASE_ANON_KEY`) and its role.
 - `jit` – just-in-time database access with the resource token (OIDC path only):
-  `management_api` is `POST <management api>/v1/projects/<ref>/database/jit` (role `postgres`), and
+  `management_api` is `POST <management api>/v1/projects/<ref>/database/jit` (role `postgres`).
   `postgres_login` logs in to the host/port/user from `POSTGRES_URL` with the resource token as the
-  password (the static password in `POSTGRES_URL` is ignored).
+  password and the startup option `--jit=true` (the static password in `POSTGRES_URL` is ignored).
+  `postgres_login_no_jit` is the same login without the option. `direct_login` logs in as `postgres`
+  to the IPv6 address of `db.<project host>`. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
 - `environment.supabase_url` – whether `SUPABASE_URL` is set and valid, and the project ref when the
   host is `<ref>.supabase.co`.
 - `end_user` – when an `Authorization: Bearer <supabase-jwt>` header is sent, the validated user
@@ -56,7 +58,7 @@ with `PGRST301` ("No suitable key or wrong key type").
 ```json
 {
   "spec": "Vercel Marketplace OIDC (spec updated Nov 18)",
-  "summary": { "status": "fail", "passed": 19, "warned": 1, "failed": 1, "skipped": 3 },
+  "summary": { "status": "fail", "passed": 19, "warned": 1, "failed": 2, "skipped": 3 },
   "results": [
     { "id": "resource_role", "group": "resource_token", "description": "...",
       "status": "fail", "expected": "service_role", "actual": null, "detail": "..." }
@@ -64,8 +66,9 @@ with `PGRST301` ("No suitable key or wrong key type").
 }
 ```
 
-Each result is `pass`, `warn`, `fail` or `skip` (skipped because an earlier step failed).
-`summary.status` is the worst status present.
+Each result is `pass`, `warn`, `fail` or `skip` (skipped because an earlier step failed
+or the runtime cannot run the check). `summary.status` is the worst of `fail`, `warn` and `pass`.
+`skip` results do not change `summary.status`.
 
 | Group | Checks |
 |---|---|
@@ -75,10 +78,30 @@ Each result is `pass`, `warn`, `fail` or `skip` (skipped because an earlier step
 | `mint` | `mint_ok` (with hints for spec error codes such as `resource_oidc_not_enabled`) |
 | `resource_token` | `resource_alg_kid`, `resource_required_claims` (aud, sub, act, iat, nbf, exp), `resource_iss`, `resource_aud`, `resource_sub`, `resource_sub_project` (sub = project ref in `SUPABASE_URL`), `resource_role` (`service_role`), `resource_act` (act.sub = deployment OIDC sub), `resource_environment`, `resource_time` (60 s tolerance), `resource_lifetime` (≤ 15 min), `resource_size` (≤ 4 KB), `resource_signature` (verified against `<iss>/jwks.json`) |
 | `database` | `db_accepted` (PGRST301 → add the issuer as a Custom OIDC third-party provider), `db_role` (runs as `service_role`), `db_claims_match`, `db_rls_bypass` (`service_role` bypasses RLS), `db_table_access`, `db_anon_control` (apikey only → `anon`), `db_tampered_rejected` (tampered token → `401 PGRST301`) |
-| `jit` | `jit_management_api` (Management API grants JIT access), `jit_postgres_login` (Postgres login with the token runs as `postgres`) |
+| `jit` | `jit_management_api` (Management API grants JIT access), `jit_postgres_login` (pooler login with the token and `--jit=true` runs as `postgres`), `jit_postgres_login_no_jit` (pooler login without `--jit=true`; this check fails until CTRL-2151 is done), `jit_direct_login` (direct IPv6 login runs as `postgres`; skipped when the host has no IPv6 address or the runtime has no IPv6 route) |
 
 Optional env vars for exact matches (otherwise the check only validates the format and warns):
 
 - `VERCEL_INTEGRATION_ID` (`oac_…`) → expected `iss` = `https://integrations.vercel.com/<id>`
 - `VERCEL_INTEGRATION_INSTALLATION_ID` (`icfg_…`) → expected `aud`
 - `SUPABASE_RESOURCE_ID` → expected `sub`
+
+## Enable JIT by hand (temporary)
+
+The JIT checks need JIT access and SSL enforcement on the Supabase project. The platform will enable both automatically for Vercel Marketplace resources, but it does not do this yet:
+
+- [CTRL-2146](https://linear.app/supabase/issue/CTRL-2146/configure-jit-when-creating-vercel-marketplace-resources): configure JIT when Vercel Marketplace resources are created.
+- [CTRL-2145](https://linear.app/supabase/issue/CTRL-2145/support-backfill-on-existing-projects): backfill existing projects.
+- [CTRL-2151](https://linear.app/supabase/issue/CTRL-2151/make-pooler-jit-login-work-without-the-jittrue-client-option): pooler JIT login without the `--jit=true` client option.
+
+Until then, enable JIT by hand:
+
+1. Link the project: `vercel link`.
+2. Pull the variables: `vercel env pull .env.local`.
+3. Run `pnpm run enable-jit`.
+
+The script needs an experimental API token. It enables SSL enforcement, then JIT access, and waits until the change is applied. It is safe to run again.
+
+The pooler can need some minutes more before it accepts JIT logins.
+
+Until CTRL-2151 is done, apps must send `options=--jit=true` through the pooler. The `jit_postgres_login_no_jit` check fails until then. The direct host is IPv6 only. Vercel functions have no IPv6 route, so the direct check is skipped there.

@@ -35,7 +35,8 @@ module.exports = `<!DOCTYPE html>
     .check.fail { border-color: var(--fail); } .pill.fail { background: var(--fail-bg); color: var(--fail); }
     .check.skip { border-color: var(--skip); } .pill.skip { background: var(--skip-bg); color: var(--skip); }
     .check.pass { background: var(--pass-bg); } .check.warn { background: var(--warn-bg); }
-    .check.fail { background: var(--fail-bg); } .check.skip { background: var(--skip-bg); }
+    .check.fail { background: var(--fail-bg); }
+    .check.skip { background: var(--skip-bg); }
     .error { color: var(--fail); }
     details { margin-top: 24px; }
     pre { background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 6px; overflow: auto; font-size: 12px; }
