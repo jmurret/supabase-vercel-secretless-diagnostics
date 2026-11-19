@@ -2,7 +2,9 @@ const crypto = require('crypto');
 
 // Expectations from "Vercel Marketplace OIDC" (Vercel OIDC secretless spec, Nov 18).
 const SPEC = 'Vercel Marketplace OIDC (spec updated Nov 18)';
-const EXPECTED_ROLE = 'authenticated';
+const EXPECTED_ROLE = 'service_role';
+// service_role has BYPASSRLS in Supabase; any other role must not bypass RLS.
+const EXPECTED_BYPASS_RLS = EXPECTED_ROLE === 'service_role';
 const MAX_TTL_S = 15 * 60;
 const CLOCK_TOLERANCE_S = 60;
 const MAX_PAYLOAD_BYTES = 4096;
@@ -514,14 +516,16 @@ const CHECKS = [
     },
   },
   {
-    id: 'db_no_rls_bypass',
+    id: 'db_rls_bypass',
     group: 'database',
-    description: 'Database role does not bypass RLS',
+    description: `Database role ${EXPECTED_BYPASS_RLS ? 'bypasses' : 'does not bypass'} RLS, as expected for "${EXPECTED_ROLE}"`,
     run: (c) => {
       const s = needDb(c);
       if (s) return s;
       if (c.db.error) return skip('Supabase rejected the token.');
-      return c.db.bypasses_rls === false ? pass(false, false) : fail(false, c.db.bypasses_rls ?? null);
+      return c.db.bypasses_rls === EXPECTED_BYPASS_RLS
+        ? pass(EXPECTED_BYPASS_RLS, c.db.bypasses_rls)
+        : fail(EXPECTED_BYPASS_RLS, c.db.bypasses_rls ?? null);
     },
   },
   {
