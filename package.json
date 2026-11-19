@@ -1,7 +1,7 @@
 {
   "name": "supabase-hello-world",
   "version": "1.0.0",
-  "description": "Supabase hello world",
+  "description": "Supabase Vercel secretless diagnotics",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
