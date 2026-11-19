@@ -2,7 +2,7 @@
 ## `GET /`
 
 Dashboard ([`dashboard.js`](./dashboard.js)) that calls `/api/diagnostics` and lists every check, grouped,
-colored by status: green = pass, yellow = warning, red = fail, orange = known issue, gray = skipped. Click a summary pill to show
+colored by status: green = pass, yellow = warning, red = fail, gray = skipped. Click a summary pill to show
 only that status (click it again, or "Overall", to show all); the filter is kept in the URL hash (e.g. `/#fail`).
 
 ## `GET /api/diagnostics`
@@ -58,7 +58,7 @@ with `PGRST301` ("No suitable key or wrong key type").
 ```json
 {
   "spec": "Vercel Marketplace OIDC (spec updated Nov 18)",
-  "summary": { "status": "fail", "passed": 19, "warned": 1, "failed": 1, "known": 1, "skipped": 3 },
+  "summary": { "status": "fail", "passed": 19, "warned": 1, "failed": 2, "skipped": 3 },
   "results": [
     { "id": "resource_role", "group": "resource_token", "description": "...",
       "status": "fail", "expected": "service_role", "actual": null, "detail": "..." }
@@ -66,9 +66,9 @@ with `PGRST301` ("No suitable key or wrong key type").
 }
 ```
 
-Each result is `pass`, `warn`, `fail`, `known` (a known issue) or `skip` (skipped because an earlier step failed
+Each result is `pass`, `warn`, `fail` or `skip` (skipped because an earlier step failed
 or the runtime cannot run the check). `summary.status` is the worst of `fail`, `warn` and `pass`.
-`known` and `skip` results do not change `summary.status`.
+`skip` results do not change `summary.status`.
 
 | Group | Checks |
 |---|---|
@@ -78,7 +78,7 @@ or the runtime cannot run the check). `summary.status` is the worst of `fail`, `
 | `mint` | `mint_ok` (with hints for spec error codes such as `resource_oidc_not_enabled`) |
 | `resource_token` | `resource_alg_kid`, `resource_required_claims` (aud, sub, act, iat, nbf, exp), `resource_iss`, `resource_aud`, `resource_sub`, `resource_sub_project` (sub = project ref in `SUPABASE_URL`), `resource_role` (`service_role`), `resource_act` (act.sub = deployment OIDC sub), `resource_environment`, `resource_time` (60 s tolerance), `resource_lifetime` (≤ 15 min), `resource_size` (≤ 4 KB), `resource_signature` (verified against `<iss>/jwks.json`) |
 | `database` | `db_accepted` (PGRST301 → add the issuer as a Custom OIDC third-party provider), `db_role` (runs as `service_role`), `db_claims_match`, `db_rls_bypass` (`service_role` bypasses RLS), `db_table_access`, `db_anon_control` (apikey only → `anon`), `db_tampered_rejected` (tampered token → `401 PGRST301`) |
-| `jit` | `jit_management_api` (Management API grants JIT access), `jit_postgres_login` (pooler login with the token and `--jit=true` runs as `postgres`), `jit_postgres_login_no_jit` (pooler login without `--jit=true`; an authentication failure is `known`, see CTRL-2151), `jit_direct_login` (direct IPv6 login runs as `postgres`; skipped when the host has no IPv6 address or the runtime has no IPv6 route) |
+| `jit` | `jit_management_api` (Management API grants JIT access), `jit_postgres_login` (pooler login with the token and `--jit=true` runs as `postgres`), `jit_postgres_login_no_jit` (pooler login without `--jit=true`; this check fails until CTRL-2151 is done), `jit_direct_login` (direct IPv6 login runs as `postgres`; skipped when the host has no IPv6 address or the runtime has no IPv6 route) |
 
 Optional env vars for exact matches (otherwise the check only validates the format and warns):
 
@@ -104,4 +104,4 @@ The script needs an experimental API token. It enables SSL enforcement, then JIT
 
 The pooler can need some minutes more before it accepts JIT logins.
 
-Until CTRL-2151 is done, apps must send `options=--jit=true` through the pooler. The direct host is IPv6 only. Vercel functions have no IPv6 route, so the direct check is skipped there.
+Until CTRL-2151 is done, apps must send `options=--jit=true` through the pooler. The `jit_postgres_login_no_jit` check fails until then. The direct host is IPv6 only. Vercel functions have no IPv6 route, so the direct check is skipped there.

@@ -47,7 +47,6 @@ const pass = (expected, actual, detail) => result('pass', expected, actual, deta
 const warn = (expected, actual, detail) => result('warn', expected, actual, detail);
 const fail = (expected, actual, detail) => result('fail', expected, actual, detail);
 const skip = (detail) => result('skip', null, null, detail);
-const known = (expected, actual, detail) => result('known', expected, actual, detail);
 
 const jwksCache = new Map();
 
@@ -620,7 +619,7 @@ const CHECKS = [
   {
     id: 'jit_postgres_login_no_jit',
     group: 'jit',
-    description: `Postgres login through POSTGRES_URL's host with the resource token as the password and without the --jit=true option (known gap CTRL-2151)`,
+    description: `Postgres login through POSTGRES_URL's host with the resource token as the password and without the --jit=true option (CTRL-2151)`,
     run: (c) => {
       const s = needResource(c);
       if (s) return s;
@@ -630,7 +629,7 @@ const CHECKS = [
       if (r.skipped) return skip(r.skipped);
       if (r.error) {
         const actual = { endpoint: r.endpoint, error: r.error };
-        return isAuthFailure(r) ? known(expected, actual, CTRL_2151_HINT) : fail(expected, actual);
+        return fail(expected, actual, isAuthFailure(r) ? CTRL_2151_HINT : undefined);
       }
       return r.current_user === JIT_ROLE
         ? pass(expected, { endpoint: r.endpoint, current_user: r.current_user, ms: r.ms }, 'CTRL-2151 may be fixed.')
@@ -675,7 +674,6 @@ async function runChecks(data, ctx, { env = process.env, now = Date.now, fetchIm
     passed: count('pass'),
     warned: count('warn'),
     failed: count('fail'),
-    known: count('known'),
     skipped: count('skip'),
   };
   summary.status = summary.failed ? 'fail' : summary.warned ? 'warn' : 'pass';
