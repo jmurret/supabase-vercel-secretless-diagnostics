@@ -1,6 +1,7 @@
 const http = require('http');
 const { createClient } = require('@supabase/supabase-js');
 const { getVercelOidcToken } = require('@vercel/functions/oidc');
+const { runChecks } = require('./checks');
 
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const KEY_ENV_VARS = ['SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY'];
@@ -121,7 +122,7 @@ async function resolveServerCredential(req) {
     };
     if (!resourceId) {
       info.resource_token.error = 'MARKETPLACE_RESOURCE_ID is not set';
-      return { client: null, info, error: new MintError(info.resource_token.error) };
+      return { client: null, info, ctx: { oidcToken: oidc.token }, error: new MintError(info.resource_token.error) };
     }
     try {
       const minted = await mintResourceToken(resourceId, oidc.token);
@@ -140,6 +141,8 @@ async function resolveServerCredential(req) {
           accessToken: async () => token,
         }),
         info,
+        // Raw tokens for checks.js signature/size checks; never serialized.
+        ctx: { oidcToken: oidc.token, resourceToken: token },
       };
     } catch (err) {
       Object.assign(info.resource_token, {
@@ -147,7 +150,7 @@ async function resolveServerCredential(req) {
         status: err.status ?? null,
         response_body: err.body ?? null,
       });
-      return { client: null, info, error: err };
+      return { client: null, info, ctx: { oidcToken: oidc.token }, error: err };
     }
   }
   const key = firstEnv(KEY_ENV_VARS);
@@ -237,7 +240,7 @@ async function handleDiagnostics(req, res) {
     supabaseHost = new URL(SUPABASE_URL).host;
   } catch {}
 
-  const body = {
+  const data = {
     timestamp: new Date().toISOString(),
     environment: {
       vercel_env: process.env.VERCEL_ENV ?? null,
@@ -247,8 +250,9 @@ async function handleDiagnostics(req, res) {
     server_credential: { ...server.info, access: serverAccess, database_identity: serverDbIdentity },
     end_user: endUser,
   };
+  const checks = await runChecks(data, server.ctx);
   res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-  res.end(JSON.stringify(body, null, 2));
+  res.end(JSON.stringify({ data, checks }, null, 2));
 }
 
 const server = http.createServer(async (req, res) => {
