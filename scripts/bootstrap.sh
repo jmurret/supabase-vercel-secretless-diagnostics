@@ -21,11 +21,23 @@ if [ -t 2 ]; then hl=$'\033[1;33m'; reset=$'\033[0m'; fi
 for cmd in vercel node curl; do
   command -v "$cmd" >/dev/null || { echo "Install $cmd first." >&2; exit 1; }
 done
-[ -f .vercel/project.json ] || { echo "Run 'vercel link' first, then run this script again." >&2; exit 1; }
+[ -f .vercel/project.json ] || [ -f .vercel/repo.json ] || { echo "Run 'vercel link' first, then run this script again." >&2; exit 1; }
 
 echo "==> Step 1: Vercel project" >&2
 info="$(vercel integration list --integration supabase --json | node -e '
-  const p = require("./.vercel/project.json");
+  const fs = require("fs");
+  let p;
+  if (fs.existsSync(".vercel/project.json")) {
+    p = require("./.vercel/project.json");
+  } else {
+    const links = require("./.vercel/repo.json").projects || [];
+    const l = links.find((x) => x.directory === ".") || (links.length === 1 && links[0]);
+    if (!l) {
+      console.error("Cannot find the linked project for this directory in .vercel/repo.json. Run vercel link again.");
+      process.exit(1);
+    }
+    p = { projectName: l.name, projectId: l.id, orgId: l.orgId };
+  }
   const all = JSON.parse(require("fs").readFileSync(0, "utf8")).resources || [];
   const mine = all.filter((r) => (r.projects || []).includes(p.projectName));
   if (mine.length !== 1) {
