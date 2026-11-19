@@ -12,6 +12,7 @@
   "license": "ISC",
   "dependencies": {
     "@supabase/supabase-js": "^2.119.0",
+    "@vercel/functions": "^3.11.3",
     "pg": "^8.11.3"
   }
 }

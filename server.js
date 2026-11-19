@@ -1,5 +1,6 @@
 const http = require('http');
 const { createClient } = require('@supabase/supabase-js');
+const { getVercelOidcToken } = require('@vercel/functions/oidc');
 
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const KEY_ENV_VARS = ['SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY'];
@@ -53,33 +54,101 @@ function describeKey(key) {
   return { key_format: payload ? 'jwt' : 'unknown', role: payload?.role ?? null };
 }
 
-function getOidcToken(req) {
+async function getOidcToken(req) {
   const header = req?.headers['x-vercel-oidc-token'];
   if (header) return { token: header, source: 'header' };
-  if (process.env.VERCEL_OIDC_TOKEN) return { token: process.env.VERCEL_OIDC_TOKEN, source: 'env' };
+  try {
+    // Falls back to Vercel's request context / VERCEL_OIDC_TOKEN (refreshed via the CLI in dev).
+    const token = await getVercelOidcToken();
+    if (token) return { token, source: 'vercel_functions' };
+  } catch {}
   return null;
 }
 
-// Uses the Vercel OIDC token (via Supabase third-party auth) when present, otherwise the
-// Supabase keys injected by the Vercel integration.
-function resolveServerCredential(req) {
-  const oidc = getOidcToken(req);
+class MintError extends Error {
+  constructor(message, status = null, body = null) {
+    super(message);
+    this.status = status;
+    this.body = body;
+  }
+}
+
+const resourceTokenCache = new Map();
+const TOKEN_REFRESH_MARGIN_MS = 60_000;
+
+// Exchanges the deployment's Vercel OIDC token for a Marketplace resource token that the
+// Supabase resource trusts. Cached until shortly before it expires.
+async function mintResourceToken(resourceId, oidcToken) {
+  const cached = resourceTokenCache.get(resourceId);
+  if (cached && cached.expiresAt - TOKEN_REFRESH_MARGIN_MS > Date.now()) {
+    return { ...cached, cached: true };
+  }
+  const res = await fetch(
+    `https://api.vercel.com/v1/integrations/marketplace/resources/${encodeURIComponent(resourceId)}/token`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${oidcToken}`, 'content-type': 'application/json' },
+    }
+  );
+  if (!res.ok) {
+    const body = (await res.text()).slice(0, 500);
+    throw new MintError(`mint failed: ${res.status}`, res.status, body);
+  }
+  const minted = await res.json();
+  if (!minted?.token) throw new MintError('mint response did not include a token');
+  const expiresAt = minted.expiresAt ?? Date.now() + (minted.expiresIn ?? 0) * 1000;
+  const entry = { token: minted.token, tokenType: minted.tokenType ?? 'bearer', expiresAt };
+  resourceTokenCache.set(resourceId, entry);
+  return { ...entry, cached: false };
+}
+
+// Uses a Marketplace resource token (minted from the Vercel OIDC token) when an OIDC token is
+// available, otherwise the Supabase keys injected by the Vercel integration.
+async function resolveServerCredential(req) {
+  const oidc = await getOidcToken(req);
   if (oidc) {
     const anonKey = firstEnv(ANON_KEY_ENV_VARS) || firstEnv(KEY_ENV_VARS);
-    const token = oidc.token;
-    return {
-      client: createClient(SUPABASE_URL, anonKey?.value, {
-        ...CLIENT_OPTIONS,
-        accessToken: async () => token,
-      }),
-      info: {
-        auth_path: 'vercel_oidc',
-        oidc_source: oidc.source,
-        apikey_env_var: anonKey?.name ?? null,
-        jwt_header: jwtHeader(token),
-        claims: safeClaims(decodeJwt(token)),
+    const resourceId = process.env.MARKETPLACE_RESOURCE_ID;
+    const info = {
+      auth_path: 'vercel_oidc_marketplace',
+      apikey_env_var: anonKey?.name ?? null,
+      oidc: {
+        source: oidc.source,
+        jwt_header: jwtHeader(oidc.token),
+        claims: safeClaims(decodeJwt(oidc.token)),
       },
+      resource_token: { resource_id: resourceId ?? null },
     };
+    if (!resourceId) {
+      info.resource_token.error = 'MARKETPLACE_RESOURCE_ID is not set';
+      return { client: null, info, error: new MintError(info.resource_token.error) };
+    }
+    try {
+      const minted = await mintResourceToken(resourceId, oidc.token);
+      Object.assign(info.resource_token, {
+        cached: minted.cached,
+        token_type: minted.tokenType,
+        expires_at: new Date(minted.expiresAt).toISOString(),
+        expires_in_s: Math.round((minted.expiresAt - Date.now()) / 1000),
+        jwt_header: jwtHeader(minted.token),
+        claims: safeClaims(decodeJwt(minted.token)),
+      });
+      const token = minted.token;
+      return {
+        client: createClient(SUPABASE_URL, anonKey?.value, {
+          ...CLIENT_OPTIONS,
+          accessToken: async () => token,
+        }),
+        info,
+      };
+    } catch (err) {
+      Object.assign(info.resource_token, {
+        error: err.message,
+        status: err.status ?? null,
+        response_body: err.body ?? null,
+      });
+      return { client: null, info, error: err };
+    }
   }
   const key = firstEnv(KEY_ENV_VARS);
   return {
@@ -156,10 +225,11 @@ async function describeEndUser(req) {
 }
 
 async function handleDiagnostics(req, res) {
-  const server = resolveServerCredential(req);
+  const server = await resolveServerCredential(req);
+  const skipped = { skipped: 'no Supabase client: resource token could not be minted' };
   const [serverAccess, serverDbIdentity, endUser] = await Promise.all([
-    probeAccess(server.client),
-    dbWhoami(server.client),
+    server.client ? probeAccess(server.client) : skipped,
+    server.client ? dbWhoami(server.client) : skipped,
     describeEndUser(req),
   ]);
   let supabaseHost = null;
@@ -193,7 +263,8 @@ const server = http.createServer(async (req, res) => {
     }
   } else if (req.url === '/api/countries' && req.method === 'GET') {
     try {
-      const { client: supabase } = resolveServerCredential(req);
+      const { client: supabase, error: credentialError } = await resolveServerCredential(req);
+      if (credentialError) throw credentialError;
       const { data: rows, error } = await supabase
         .from('countries')
         .select('name')
