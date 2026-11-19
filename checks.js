@@ -47,6 +47,7 @@ const pass = (expected, actual, detail) => result('pass', expected, actual, deta
 const warn = (expected, actual, detail) => result('warn', expected, actual, detail);
 const fail = (expected, actual, detail) => result('fail', expected, actual, detail);
 const skip = (detail) => result('skip', null, null, detail);
+const known = (expected, actual, detail) => result('known', expected, actual, detail);
 
 const jwksCache = new Map();
 
@@ -132,6 +133,12 @@ const needDb = (c) =>
   needResource(c) || (c.db && !c.db.skipped ? null : skip('database_identity was not queried.'));
 
 const isSkipped = (r) => !r || r.skipped;
+
+const JIT_HINT = 'Check that JIT access is enabled: run `pnpm run enable-jit`.';
+const CTRL_2151_HINT = 'Known issue CTRL-2151: the pooler needs `--jit=true`.';
+const NO_ROUTE_CODES = ['ENETUNREACH', 'EHOSTUNREACH', 'EADDRNOTAVAIL', 'ETIMEDOUT'];
+const isAuthFailure = (r) => r.code === '28P01' || /password authentication failed/.test(r.error);
+const isNoRoute = (r) => NO_ROUTE_CODES.includes(r.code) || r.error === 'timeout expired';
 
 const CHECKS = [
   {
@@ -590,13 +597,13 @@ const CHECKS = [
       if (r.skipped) return warn('HTTP 200', null, r.skipped);
       if (r.status === 200) return pass(`HTTP 200, role ${JIT_ROLE}`, { status: r.status, role: r.role ?? null, ms: r.ms });
       return fail(`HTTP 200, role ${JIT_ROLE}`, { status: r.status ?? null, error: r.error ?? null },
-        'Check that JIT access is enabled for the project (needs an Owner or Admin to enable).');
+        JIT_HINT);
     },
   },
   {
     id: 'jit_postgres_login',
     group: 'jit',
-    description: `Postgres login through POSTGRES_URL's host with the resource token as the password runs as ${JIT_ROLE}`,
+    description: `Postgres login through POSTGRES_URL's host with the resource token as the password and the --jit=true option runs as ${JIT_ROLE}`,
     run: (c) => {
       const s = needResource(c);
       if (s) return s;
@@ -604,13 +611,48 @@ const CHECKS = [
       const expected = `current_user = ${JIT_ROLE}`;
       if (!r) return skip('Postgres login was not attempted.');
       if (r.skipped) return fail(expected, null, r.skipped);
-      if (r.error) {
-        const ref = c.url?.project_ref ?? '<ref>';
-        return fail(expected, { endpoint: r.endpoint, error: r.error },
-          `Check that JIT access is enabled for the project (GET /v1/projects/${ref}/jit-access, needs Owner or Admin).`);
-      }
+      if (r.error) return fail(expected, { endpoint: r.endpoint, error: r.error }, JIT_HINT);
       return r.current_user === JIT_ROLE
         ? pass(expected, { endpoint: r.endpoint, current_user: r.current_user, ms: r.ms })
+        : fail(expected, { endpoint: r.endpoint, current_user: r.current_user });
+    },
+  },
+  {
+    id: 'jit_postgres_login_no_jit',
+    group: 'jit',
+    description: `Postgres login through POSTGRES_URL's host with the resource token as the password and without the --jit=true option (known gap CTRL-2151)`,
+    run: (c) => {
+      const s = needResource(c);
+      if (s) return s;
+      const r = c.jit?.postgres_login_no_jit;
+      const expected = `current_user = ${JIT_ROLE}`;
+      if (!r) return skip('Postgres login was not attempted.');
+      if (r.skipped) return skip(r.skipped);
+      if (r.error) {
+        const actual = { endpoint: r.endpoint, error: r.error };
+        return isAuthFailure(r) ? known(expected, actual, CTRL_2151_HINT) : fail(expected, actual);
+      }
+      return r.current_user === JIT_ROLE
+        ? pass(expected, { endpoint: r.endpoint, current_user: r.current_user, ms: r.ms }, 'CTRL-2151 may be fixed.')
+        : fail(expected, { endpoint: r.endpoint, current_user: r.current_user });
+    },
+  },
+  {
+    id: 'jit_direct_login',
+    group: 'jit',
+    description: `Postgres login to the direct host (db.<project host>, IPv6 only) with the resource token as the password runs as ${JIT_ROLE}`,
+    run: (c) => {
+      const s = needResource(c);
+      if (s) return s;
+      const r = c.jit?.direct_login;
+      const expected = `current_user = ${JIT_ROLE}`;
+      if (!r) return skip('Direct login was not attempted.');
+      if (r.skipped) return skip(r.skipped);
+      if (r.resolve_failed) return skip('The direct host has no IPv6 address.');
+      if (isNoRoute(r)) return skip(`This runtime has no IPv6 route to the direct host. ${r.error} via ${r.endpoint}.`);
+      if (r.error) return fail(expected, { endpoint: r.endpoint, error: r.error }, JIT_HINT);
+      return r.current_user === JIT_ROLE
+        ? pass(expected, { endpoint: r.endpoint, address: r.address, current_user: r.current_user, ms: r.ms })
         : fail(expected, { endpoint: r.endpoint, current_user: r.current_user });
     },
   },
@@ -629,7 +671,13 @@ async function runChecks(data, ctx, { env = process.env, now = Date.now, fetchIm
     results.push({ id: check.id, group: check.group, description: check.description, ...outcome });
   }
   const count = (st) => results.filter((r) => r.status === st).length;
-  const summary = { passed: count('pass'), warned: count('warn'), failed: count('fail'), skipped: count('skip') };
+  const summary = {
+    passed: count('pass'),
+    warned: count('warn'),
+    failed: count('fail'),
+    known: count('known'),
+    skipped: count('skip'),
+  };
   summary.status = summary.failed ? 'fail' : summary.warned ? 'warn' : 'pass';
   return { spec: SPEC, summary: { status: summary.status, ...summary }, results };
 }

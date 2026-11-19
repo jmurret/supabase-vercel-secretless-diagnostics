@@ -9,6 +9,7 @@ module.exports = `<!DOCTYPE html>
       --pass: #16a34a; --pass-bg: #dcfce7;
       --warn: #ca8a04; --warn-bg: #fef9c3;
       --fail: #dc2626; --fail-bg: #fee2e2;
+      --known: #c2410c; --known-bg: #ffedd5;
       --skip: #6b7280; --skip-bg: #f3f4f6;
     }
     * { box-sizing: border-box; }
@@ -33,9 +34,11 @@ module.exports = `<!DOCTYPE html>
     .check.pass { border-color: var(--pass); } .pill.pass { background: var(--pass-bg); color: var(--pass); }
     .check.warn { border-color: var(--warn); } .pill.warn { background: var(--warn-bg); color: var(--warn); }
     .check.fail { border-color: var(--fail); } .pill.fail { background: var(--fail-bg); color: var(--fail); }
+    .check.known { border-color: var(--known); } .pill.known { background: var(--known-bg); color: var(--known); }
     .check.skip { border-color: var(--skip); } .pill.skip { background: var(--skip-bg); color: var(--skip); }
     .check.pass { background: var(--pass-bg); } .check.warn { background: var(--warn-bg); }
-    .check.fail { background: var(--fail-bg); } .check.skip { background: var(--skip-bg); }
+    .check.fail { background: var(--fail-bg); } .check.known { background: var(--known-bg); }
+    .check.skip { background: var(--skip-bg); }
     .error { color: var(--fail); }
     details { margin-top: 24px; }
     pre { background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 6px; overflow: auto; font-size: 12px; }
@@ -53,7 +56,7 @@ module.exports = `<!DOCTYPE html>
     <pre id="raw"></pre>
   </details>
   <script>
-    const LABELS = { pass: 'Pass', warn: 'Warning', fail: 'Fail', skip: 'Skipped' };
+    const LABELS = { pass: 'Pass', warn: 'Warning', fail: 'Fail', known: 'Known', skip: 'Skipped' };
     const STATUSES = Object.keys(LABELS);
     let results = [];
     let filter = STATUSES.includes(location.hash.slice(1)) ? location.hash.slice(1) : null;
@@ -133,6 +136,7 @@ module.exports = `<!DOCTYPE html>
           pill('pass', s.passed + ' passed', 'pass', s.passed),
           pill('warn', s.warned + ' warnings', 'warn', s.warned),
           pill('fail', s.failed + ' failed', 'fail', s.failed),
+          pill('known', s.known + ' known', 'known', s.known),
           pill('skip', s.skipped + ' skipped', 'skip', s.skipped));
         const env = data.environment || {};
         meta.textContent = [checks.spec, env.vercel_env, env.vercel_region, env.supabase_url_host, data.timestamp]

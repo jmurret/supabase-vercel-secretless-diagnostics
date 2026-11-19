@@ -1,5 +1,6 @@
 const { createClient } = require('@supabase/supabase-js');
 const { getVercelOidcToken } = require('@vercel/functions/oidc');
+const dns = require('node:dns');
 const { Client } = require('pg');
 const { runChecks } = require('../checks');
 
@@ -300,24 +301,30 @@ async function requestJitAccess(token) {
 }
 
 // Logs in to Postgres with the resource token as the password; the password in POSTGRES_URL is ignored.
-async function loginWithToken(token) {
-  if (!process.env.POSTGRES_URL) return { skipped: 'POSTGRES_URL is not set' };
-  let url;
-  try {
-    url = new URL(process.env.POSTGRES_URL);
-  } catch {
-    return { skipped: 'POSTGRES_URL is not a valid URL' };
+// Without an explicit host, host, port and user come from POSTGRES_URL.
+async function loginWithToken(token, { host, port, user, options, servername, endpoint, timeoutMs = 10_000 } = {}) {
+  if (!host) {
+    if (!process.env.POSTGRES_URL) return { skipped: 'POSTGRES_URL is not set' };
+    let url;
+    try {
+      url = new URL(process.env.POSTGRES_URL);
+    } catch {
+      return { skipped: 'POSTGRES_URL is not a valid URL' };
+    }
+    host = url.hostname;
+    port = Number(url.port) || 5432;
+    user = decodeURIComponent(url.username);
   }
-  const port = Number(url.port) || 5432;
-  const endpoint = `${url.hostname}:${port}`;
+  endpoint ??= `${host}:${port}`;
   const client = new Client({
-    host: url.hostname,
+    host,
     port,
-    user: decodeURIComponent(url.username),
+    user,
     password: token,
+    ...(options && { options }),
     database: 'postgres',
-    ssl: { rejectUnauthorized: false },
-    connectionTimeoutMillis: 10_000,
+    ssl: { rejectUnauthorized: false, ...(servername && { servername }) },
+    connectionTimeoutMillis: timeoutMs,
   });
   client.on('error', () => {});
   const started = Date.now();
@@ -326,10 +333,34 @@ async function loginWithToken(token) {
     const { rows } = await client.query('select current_user');
     return { endpoint, current_user: rows[0].current_user, ms: Date.now() - started };
   } catch (err) {
-    return { endpoint, error: err.message, ms: Date.now() - started };
+    return { endpoint, error: err.message, code: err.code, ms: Date.now() - started };
   } finally {
     await client.end().catch(() => {});
   }
+}
+
+// The direct host has only an AAAA record. Resolve it explicitly and connect to the IPv6 address,
+// with the host name as the TLS server name.
+async function loginDirect(token, hostname) {
+  const started = Date.now();
+  let address;
+  try {
+    [address] = await dns.promises.resolve6(hostname);
+  } catch (err) {
+    return { resolve_failed: true, error: err.message, code: err.code, ms: Date.now() - started };
+  }
+  if (!address) {
+    return { resolve_failed: true, error: `no AAAA record for ${hostname}`, ms: Date.now() - started };
+  }
+  const login = await loginWithToken(token, {
+    host: address,
+    port: 5432,
+    user: JIT_ROLE,
+    servername: hostname,
+    endpoint: `[${address}]`,
+    timeoutMs: 5000,
+  });
+  return { ...login, address, ms: Date.now() - started };
 }
 
 async function runDiagnostics(req, res) {
@@ -341,12 +372,15 @@ async function runDiagnostics(req, res) {
       : 'no Supabase client: resource token could not be minted',
   };
   const noToken = { skipped: 'no resource token' };
-  const [serverAccess, serverDbIdentity, controls, jitApi, jitLogin, endUser] = await Promise.all([
+  const directHost = SUPABASE_URL_INFO.project_ref ? `db.${SUPABASE_URL_INFO.host}` : null;
+  const [serverAccess, serverDbIdentity, controls, jitApi, jitLogin, jitLoginNoJit, directLogin, endUser] = await Promise.all([
     server.client ? probeAccess(server.client) : skipped,
     server.client ? dbWhoami(server.client) : skipped,
     server.client && resourceToken ? runControls(server.ctx) : skipped,
     resourceToken ? requestJitAccess(resourceToken) : noToken,
+    resourceToken ? loginWithToken(resourceToken, { options: '--jit=true' }) : noToken,
     resourceToken ? loginWithToken(resourceToken) : noToken,
+    resourceToken && directHost ? loginDirect(resourceToken, directHost) : noToken,
     describeEndUser(req),
   ]);
 
@@ -364,7 +398,12 @@ async function runDiagnostics(req, res) {
       database_identity: serverDbIdentity,
       ...(server.info.auth_path === 'vercel_oidc_marketplace' && { controls }),
     },
-    jit: { management_api: jitApi, postgres_login: jitLogin },
+    jit: {
+      management_api: jitApi,
+      postgres_login: jitLogin,
+      postgres_login_no_jit: jitLoginNoJit,
+      direct_login: directLogin,
+    },
     end_user: endUser,
   };
   const checks = await runChecks(data, server.ctx);
