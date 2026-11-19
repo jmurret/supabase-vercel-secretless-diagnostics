@@ -25,7 +25,7 @@ as $$
       from claims, jsonb_each(claims.c)
       where key in (
         'iss', 'sub', 'aud', 'role', 'exp', 'iat', 'email', 'aal', 'is_anonymous', 'session_id',
-        'owner', 'owner_id', 'project', 'project_id', 'environment'
+        'owner', 'owner_id', 'project', 'project_id', 'environment', 'act'
       )
     ),
     'member_of', (

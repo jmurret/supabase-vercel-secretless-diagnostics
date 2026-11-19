@@ -8,7 +8,7 @@ const ANON_KEY_ENV_VARS = ['SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY']
 const PROBE_TABLES = ['countries'];
 const SAFE_CLAIMS = [
   'iss', 'sub', 'aud', 'role', 'exp', 'iat', 'nbf', 'email', 'scope', 'aal', 'is_anonymous',
-  'owner', 'owner_id', 'project', 'project_id', 'environment', 'user_id',
+  'owner', 'owner_id', 'project', 'project_id', 'environment', 'user_id', 'act',
 ];
 const CLIENT_OPTIONS = { auth: { persistSession: false, autoRefreshToken: false } };
 
