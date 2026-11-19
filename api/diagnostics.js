@@ -339,7 +339,7 @@ async function loginWithToken(token, { host, port, user, options, servername, en
   }
 }
 
-// The direct host has only an AAAA record. Resolve it explicitly and connect to the IPv6 address,
+// The direct host has only an AAAA record by default (IPv4 is a paid feature). Resolve it explicitly and connect to the IPv6 address,
 // with the host name as the TLS server name.
 async function loginDirect(token, hostname) {
   const started = Date.now();
