@@ -2,7 +2,7 @@
 # Enable JIT database access on the Supabase project in .env.local.
 # Workaround until the platform does this for Vercel Marketplace resources
 # (CTRL-2145, CTRL-2146). Safe to run many times.
-# Needs: curl, node, a .env.local from `vercel env pull .env.local`, and an
+# Needs: curl, node, a .env.local from `pnpm run bootstrap`, and an
 # experimental API token.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 hl="" reset=""
 if [ -t 2 ]; then hl=$'\033[1;33m'; reset=$'\033[0m'; fi
 
-[ -f .env.local ] || { echo "Run 'vercel env pull .env.local' first." >&2; exit 1; }
+[ -f .env.local ] || { echo "Run 'pnpm run bootstrap' first." >&2; exit 1; }
 url="$(grep -E '^SUPABASE_URL=' .env.local | tail -n 1 | cut -d= -f2- | sed -E 's/^"(.*)"$/\1/' || true)"
 host="${url#*://}"
 host="${host%%/*}"
