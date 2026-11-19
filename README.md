@@ -9,9 +9,10 @@ Use a Vercel project that has the Supabase Marketplace integration. Then do thes
    - Sets `MARKETPLACE_RESOURCE_ID` to the Supabase resource that is connected to the linked project.
    - Removes `SUPABASE_JWT_SECRET`, `SUPABASE_SECRET_KEY` and `SUPABASE_SERVICE_ROLE_KEY` from the project. Code that uses these static secrets stops working.
    - Replaces `.env.local` with the Development variables. It warns if `POSTGRES_URL` is not set.
-   - Applies the files in `supabase/migrations` (`public.whoami_vercel()` and `public.countries`). It asks for a Supabase access token only when the schema is missing. The token is hidden and is not saved. You can set `SUPABASE_ACCESS_TOKEN` to skip the prompt.
-3. Run `pnpm run enable-jit`. The JIT checks need it until CTRL-2145 and CTRL-2146 are done. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
-4. Redeploy, so that existing deployments get the changes.
+   - Applies the files in `supabase/migrations` (`public.whoami_vercel()` and `public.countries`). It asks once for a Supabase access token. Use an experimental API token. The token is hidden and is not saved. Press Enter to skip it, or set `SUPABASE_ACCESS_TOKEN` to skip the prompt. The schema step needs the token when the schema is missing.
+   - Offers to enable the Supabase IPv4 add-on when `db.<project host>` has no IPv4 address. The add-on is paid. Without it, the direct login check is skipped on Vercel. If the request fails, the script only prints a warning and the manual command.
+   - Enables JIT access and SSL enforcement with the same token, until CTRL-2145 and CTRL-2146 are done. If this fails or you skipped the token, the script only prints a warning. Then run `pnpm run enable-jit`. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
+3. Redeploy, so that existing deployments get the changes.
 
 ## `GET /`
 
@@ -109,7 +110,7 @@ The JIT checks need JIT access and SSL enforcement on the Supabase project. The 
 - [CTRL-2145](https://linear.app/supabase/issue/CTRL-2145/support-backfill-on-existing-projects): backfill existing projects.
 - [CTRL-2151](https://linear.app/supabase/issue/CTRL-2151/make-pooler-jit-login-work-without-the-jittrue-client-option): pooler JIT login without the `--jit=true` client option.
 
-Until then, enable JIT by hand:
+`pnpm run bootstrap` enables both when it has an access token. To run only this step, for example after you skipped the token:
 
 1. Do the steps in [Set up](#set-up) to link the project and pull `.env.local` (`pnpm run bootstrap`).
 2. Run `pnpm run enable-jit`.
@@ -118,4 +119,4 @@ The script needs an experimental API token. It enables SSL enforcement, then JIT
 
 The pooler can need some minutes more before it accepts JIT logins.
 
-Until CTRL-2151 is done, apps must send `options=--jit=true` through the pooler. The `jit_postgres_login_no_jit` check fails until then. Without the Supabase IPv4 add-on, the direct host is IPv6 only. Vercel functions have no IPv6 route, so the direct check is skipped there unless the project has the IPv4 add-on.
+Until CTRL-2151 is done, apps must send `options=--jit=true` through the pooler. The `jit_postgres_login_no_jit` check fails until then. Without the Supabase IPv4 add-on, the direct host is IPv6 only. Vercel functions have no IPv6 route, so the direct check is skipped there unless the project has the IPv4 add-on. `pnpm run bootstrap` offers to enable the add-on.
