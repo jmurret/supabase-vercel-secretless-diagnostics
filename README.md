@@ -1,7 +1,13 @@
 # supabase-vercel-secretless-daignostics
 ## `GET /`
 
-Returns JSON (non-secret) shaped as `{ "data": {...}, "checks": {...} }`. Always HTTP 200.
+Dashboard ([`dashboard.js`](./dashboard.js)) that calls `/api/diagnostics` and lists every check, grouped,
+colored by status: green = pass, yellow = warning, red = fail, gray = skipped.
+
+## `GET /api/diagnostics`
+
+Handled by [`api/diagnostics.js`](./api/diagnostics.js) (a `(req, res)` handler used by `server.js` locally
+and deployable as a Vercel function). Returns JSON (non-secret) shaped as `{ "data": {...}, "checks": {...} }`. Always HTTP 200.
 
 `data` describes the current auth context:
 
