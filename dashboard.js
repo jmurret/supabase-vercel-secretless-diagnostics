@@ -18,7 +18,11 @@ module.exports = `<!DOCTYPE html>
     h2 { font-size: 15px; margin: 24px 0 8px; text-transform: uppercase; letter-spacing: .04em; color: #475569; }
     .meta { color: #64748b; font-size: 13px; }
     .summary { display: flex; gap: 8px; flex-wrap: wrap; }
-    .pill { padding: 4px 10px; border-radius: 999px; font-size: 13px; font-weight: 600; }
+    .pill { padding: 4px 10px; border-radius: 999px; font-size: 13px; font-weight: 600; border: 2px solid transparent; font-family: inherit; }
+    button.pill { cursor: pointer; }
+    button.pill:disabled { cursor: default; opacity: .4; }
+    .summary.filtered button.pill:not(.active) { opacity: .5; }
+    button.pill.active { border-color: currentColor; }
     .check { border-left: 6px solid; border-radius: 6px; padding: 10px 14px; margin-bottom: 8px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
     .check .title { display: flex; justify-content: space-between; gap: 12px; font-weight: 600; }
     .check .id { font-family: ui-monospace, monospace; font-size: 12px; color: #64748b; font-weight: 400; }
@@ -26,10 +30,10 @@ module.exports = `<!DOCTYPE html>
     .check dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 6px 0 0; font-size: 13px; }
     .check dt { color: #64748b; }
     .check dd { margin: 0; font-family: ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; }
-    .pass { border-color: var(--pass); } .pill.pass { background: var(--pass-bg); color: var(--pass); }
-    .warn { border-color: var(--warn); } .pill.warn { background: var(--warn-bg); color: var(--warn); }
-    .fail { border-color: var(--fail); } .pill.fail { background: var(--fail-bg); color: var(--fail); }
-    .skip { border-color: var(--skip); } .pill.skip { background: var(--skip-bg); color: var(--skip); }
+    .check.pass { border-color: var(--pass); } .pill.pass { background: var(--pass-bg); color: var(--pass); }
+    .check.warn { border-color: var(--warn); } .pill.warn { background: var(--warn-bg); color: var(--warn); }
+    .check.fail { border-color: var(--fail); } .pill.fail { background: var(--fail-bg); color: var(--fail); }
+    .check.skip { border-color: var(--skip); } .pill.skip { background: var(--skip-bg); color: var(--skip); }
     .check.pass { background: var(--pass-bg); } .check.warn { background: var(--warn-bg); }
     .check.fail { background: var(--fail-bg); } .check.skip { background: var(--skip-bg); }
     .error { color: var(--fail); }
@@ -50,6 +54,9 @@ module.exports = `<!DOCTYPE html>
   </details>
   <script>
     const LABELS = { pass: 'Pass', warn: 'Warning', fail: 'Fail', skip: 'Skipped' };
+    const STATUSES = Object.keys(LABELS);
+    let results = [];
+    let filter = STATUSES.includes(location.hash.slice(1)) ? location.hash.slice(1) : null;
 
     function el(tag, attrs = {}, ...children) {
       const node = document.createElement(tag);
@@ -72,6 +79,44 @@ module.exports = `<!DOCTYPE html>
         r.status === 'skip' ? null : dl);
     }
 
+    function setFilter(status) {
+      filter = status === filter ? null : status;
+      history.replaceState(null, '', filter ? '#' + filter : location.pathname + location.search);
+      render();
+    }
+
+    function render() {
+      document.getElementById('summary').classList.toggle('filtered', Boolean(filter));
+      for (const pill of document.querySelectorAll('#summary button.pill')) {
+        const active = pill.dataset.filter === (filter || 'all');
+        pill.classList.toggle('active', active);
+        pill.setAttribute('aria-pressed', String(active));
+      }
+      const groups = new Map();
+      for (const r of results) {
+        if (filter && r.status !== filter) continue;
+        if (!groups.has(r.group)) groups.set(r.group, []);
+        groups.get(r.group).push(r);
+      }
+      const main = document.getElementById('checks');
+      if (!groups.size) {
+        main.replaceChildren(el('p', { className: 'meta', textContent: 'No checks match this filter.' }));
+        return;
+      }
+      main.replaceChildren(...[...groups].flatMap(([group, items]) => [
+        el('h2', { textContent: group.replace(/_/g, ' ') }),
+        ...items.map(renderCheck),
+      ]));
+    }
+
+    function pill(status, text, value, count) {
+      const button = el('button', { type: 'button', className: 'pill ' + status, textContent: text, disabled: count === 0 });
+      button.dataset.filter = value;
+      button.title = value === 'all' ? 'Show all checks' : 'Show only ' + LABELS[status].toLowerCase() + ' checks';
+      button.addEventListener('click', () => setFilter(value === 'all' ? null : value));
+      return button;
+    }
+
     async function load() {
       const main = document.getElementById('checks');
       const summary = document.getElementById('summary');
@@ -84,29 +129,27 @@ module.exports = `<!DOCTYPE html>
         const { checks, data } = body;
         const s = checks.summary;
         summary.replaceChildren(
-          el('span', { className: 'pill ' + s.status, textContent: 'Overall: ' + LABELS[s.status] }),
-          el('span', { className: 'pill pass', textContent: s.passed + ' passed' }),
-          el('span', { className: 'pill warn', textContent: s.warned + ' warnings' }),
-          el('span', { className: 'pill fail', textContent: s.failed + ' failed' }),
-          el('span', { className: 'pill skip', textContent: s.skipped + ' skipped' }));
+          pill(s.status, 'Overall: ' + LABELS[s.status], 'all'),
+          pill('pass', s.passed + ' passed', 'pass', s.passed),
+          pill('warn', s.warned + ' warnings', 'warn', s.warned),
+          pill('fail', s.failed + ' failed', 'fail', s.failed),
+          pill('skip', s.skipped + ' skipped', 'skip', s.skipped));
         const env = data.environment || {};
         meta.textContent = [checks.spec, env.vercel_env, env.vercel_region, env.supabase_url_host, data.timestamp]
           .filter(Boolean).join(' · ');
-        const groups = new Map();
-        for (const r of checks.results) {
-          if (!groups.has(r.group)) groups.set(r.group, []);
-          groups.get(r.group).push(r);
-        }
-        main.replaceChildren(...[...groups].flatMap(([group, results]) => [
-          el('h2', { textContent: group.replace(/_/g, ' ') }),
-          ...results.map(renderCheck),
-        ]));
+        results = checks.results;
+        render();
       } catch (err) {
         summary.replaceChildren();
         main.replaceChildren(el('p', { className: 'error', textContent: 'Failed to load diagnostics: ' + err.message }));
       }
     }
 
+    window.addEventListener('hashchange', () => {
+      const status = location.hash.slice(1);
+      filter = STATUSES.includes(status) ? status : null;
+      render();
+    });
     load();
   </script>
 </body>

@@ -2,7 +2,8 @@
 ## `GET /`
 
 Dashboard ([`dashboard.js`](./dashboard.js)) that calls `/api/diagnostics` and lists every check, grouped,
-colored by status: green = pass, yellow = warning, red = fail, gray = skipped.
+colored by status: green = pass, yellow = warning, red = fail, gray = skipped. Click a summary pill to show
+only that status (click it again, or "Overall", to show all); the filter is kept in the URL hash (e.g. `/#fail`).
 
 ## `GET /api/diagnostics`
 
