@@ -31,7 +31,8 @@ and deployable as a Vercel function). Returns JSON (non-secret) shaped as `{ "da
   `postgres_login` logs in to the host/port/user from `POSTGRES_URL` with the resource token as the
   password and the startup option `--jit=true` (the static password in `POSTGRES_URL` is ignored).
   `postgres_login_no_jit` is the same login without the option. `direct_login` logs in as `postgres`
-  to the IPv6 address of `db.<project host>`. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
+  to `db.<project host>`. It uses the IPv4 address when the host has one (Supabase IPv4 add-on),
+  and the IPv6 address otherwise. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
 - `environment.supabase_url` – whether `SUPABASE_URL` is set and valid, and the project ref when the
   host is `<ref>.supabase.co`.
 - `end_user` – when an `Authorization: Bearer <supabase-jwt>` header is sent, the validated user
@@ -78,7 +79,7 @@ or the runtime cannot run the check). `summary.status` is the worst of `fail`, `
 | `mint` | `mint_ok` (with hints for spec error codes such as `resource_oidc_not_enabled`) |
 | `resource_token` | `resource_alg_kid`, `resource_required_claims` (aud, sub, act, iat, nbf, exp), `resource_iss`, `resource_aud`, `resource_sub`, `resource_sub_project` (sub = project ref in `SUPABASE_URL`), `resource_role` (`service_role`), `resource_act` (act.sub = deployment OIDC sub), `resource_environment`, `resource_time` (60 s tolerance), `resource_lifetime` (≤ 15 min), `resource_size` (≤ 4 KB), `resource_signature` (verified against `<iss>/jwks.json`) |
 | `database` | `db_accepted` (PGRST301 → add the issuer as a Custom OIDC third-party provider), `db_role` (runs as `service_role`), `db_claims_match`, `db_rls_bypass` (`service_role` bypasses RLS), `db_table_access`, `db_anon_control` (apikey only → `anon`), `db_tampered_rejected` (tampered token → `401 PGRST301`) |
-| `jit` | `jit_management_api` (Management API grants JIT access), `jit_postgres_login` (pooler login with the token and `--jit=true` runs as `postgres`), `jit_postgres_login_no_jit` (pooler login without `--jit=true`; this check fails until CTRL-2151 is done), `jit_direct_login` (direct IPv6 login runs as `postgres`; skipped when the host has no IPv6 address or the runtime has no IPv6 route) |
+| `jit` | `jit_management_api` (Management API grants JIT access), `jit_postgres_login` (pooler login with the token and `--jit=true` runs as `postgres`), `jit_postgres_login_no_jit` (pooler login without `--jit=true`; this check fails until CTRL-2151 is done), `jit_direct_login` (direct login runs as `postgres`; uses the IPv4 address when the host has one, else IPv6; skipped when the host has only an IPv6 address and the runtime has no IPv6 route) |
 
 Optional env vars for exact matches (otherwise the check only validates the format and warns):
 
@@ -104,4 +105,4 @@ The script needs an experimental API token. It enables SSL enforcement, then JIT
 
 The pooler can need some minutes more before it accepts JIT logins.
 
-Until CTRL-2151 is done, apps must send `options=--jit=true` through the pooler. The `jit_postgres_login_no_jit` check fails until then. The direct host is IPv6 only. Vercel functions have no IPv6 route, so the direct check is skipped there.
+Until CTRL-2151 is done, apps must send `options=--jit=true` through the pooler. The `jit_postgres_login_no_jit` check fails until then. Without the Supabase IPv4 add-on, the direct host is IPv6 only. Vercel functions have no IPv6 route, so the direct check is skipped there unless the project has the IPv4 add-on.

@@ -639,7 +639,7 @@ const CHECKS = [
   {
     id: 'jit_direct_login',
     group: 'jit',
-    description: `Postgres login to the direct host (db.<project host>, IPv6 only) with the resource token as the password runs as ${JIT_ROLE}`,
+    description: `Postgres login to the direct host (db.<project host>, IPv4 if it has an address, else IPv6) with the resource token as the password runs as ${JIT_ROLE}`,
     run: (c) => {
       const s = needResource(c);
       if (s) return s;
@@ -647,8 +647,10 @@ const CHECKS = [
       const expected = `current_user = ${JIT_ROLE}`;
       if (!r) return skip('Direct login was not attempted.');
       if (r.skipped) return skip(r.skipped);
-      if (r.resolve_failed) return skip('The direct host has no IPv6 address.');
-      if (isNoRoute(r)) return skip(`This runtime has no IPv6 route to the direct host. ${r.error} via ${r.endpoint}.`);
+      if (r.resolve_failed) return skip('The direct host has no IPv4 or IPv6 address.');
+      if (r.family === 6 && isNoRoute(r)) {
+        return skip(`The direct host has only an IPv6 address, and this runtime has no IPv6 route. Add the IPv4 add-on to the project to test it from here. ${r.error} via ${r.endpoint}.`);
+      }
       if (r.error) return fail(expected, { endpoint: r.endpoint, error: r.error }, JIT_HINT);
       return r.current_user === JIT_ROLE
         ? pass(expected, { endpoint: r.endpoint, address: r.address, current_user: r.current_user, ms: r.ms })

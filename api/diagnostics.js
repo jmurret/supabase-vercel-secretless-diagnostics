@@ -339,28 +339,28 @@ async function loginWithToken(token, { host, port, user, options, servername, en
   }
 }
 
-// The direct host has only an AAAA record by default (IPv4 is a paid feature). Resolve it explicitly and connect to the IPv6 address,
-// with the host name as the TLS server name.
+// The direct host has an A record only with the IPv4 add-on, and always has an AAAA record. Prefer IPv4, fall back to IPv6,
+// and connect to the address literal with the host name as the TLS server name.
 async function loginDirect(token, hostname) {
   const started = Date.now();
-  let address;
-  try {
-    [address] = await dns.promises.resolve6(hostname);
-  } catch (err) {
-    return { resolve_failed: true, error: err.message, code: err.code, ms: Date.now() - started };
-  }
+  const [[v4], [v6]] = await Promise.all([
+    dns.promises.resolve4(hostname).catch(() => []),
+    dns.promises.resolve6(hostname).catch(() => []),
+  ]);
+  const address = v4 ?? v6;
   if (!address) {
-    return { resolve_failed: true, error: `no AAAA record for ${hostname}`, ms: Date.now() - started };
+    return { resolve_failed: true, error: `no A or AAAA record for ${hostname}`, ms: Date.now() - started };
   }
+  const family = v4 ? 4 : 6;
   const login = await loginWithToken(token, {
     host: address,
     port: 5432,
     user: JIT_ROLE,
     servername: hostname,
-    endpoint: `[${address}]`,
+    endpoint: family === 6 ? `[${address}]` : address,
     timeoutMs: 5000,
   });
-  return { ...login, address, ms: Date.now() - started };
+  return { ...login, address, family, ms: Date.now() - started };
 }
 
 async function runDiagnostics(req, res) {
