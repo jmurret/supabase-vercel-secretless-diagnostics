@@ -82,6 +82,12 @@ env_value() {
     grep -E "^$name=" .env.local | tail -n 1 | cut -d= -f2- | sed -E 's/^"(.*)"$/\1/' || true
   done | head -n 1
 }
+if [ -z "$(env_value SUPABASE_URL NEXT_PUBLIC_SUPABASE_URL)" ]; then
+  echo "${hl}Warning: the Development variables have no SUPABASE_URL. The Supabase integration is not connected to the Development environment. Using the Preview variables in .env.local instead.${reset}" >&2
+  echo "  To run locally with Development variables, add the Development environment to the project connection of the Supabase resource in Vercel (Storage)." >&2
+  rm -f .env.local
+  vercel env pull .env.local --environment preview --yes
+fi
 [ -n "$(env_value POSTGRES_URL)" ] || echo "Warning: POSTGRES_URL is not set. The JIT login checks need it from the Supabase integration." >&2
 
 echo >&2
@@ -91,7 +97,7 @@ url="${url%/}"
 key="$(env_value SUPABASE_PUBLISHABLE_KEY NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY SUPABASE_ANON_KEY NEXT_PUBLIC_SUPABASE_ANON_KEY)"
 host="${url#*://}"
 ref="${host%%.*}"
-[ -n "$ref" ] || { echo "SUPABASE_URL is not in .env.local." >&2; exit 1; }
+[ -n "$ref" ] || { echo "SUPABASE_URL is not in the Development or Preview variables. Check that the Supabase resource is connected to this Vercel project." >&2; exit 1; }
 
 case "$host" in
   *.supabase.red) mgmt=https://api.supabase.green dashboard=https://supabase.green/dashboard ;;
