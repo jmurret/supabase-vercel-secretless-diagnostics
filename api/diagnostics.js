@@ -1,16 +1,50 @@
 const { createClient } = require('@supabase/supabase-js');
 const { getVercelOidcToken } = require('@vercel/functions/oidc');
+const { Client } = require('pg');
 const { runChecks } = require('../checks');
 
-const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+const URL_ENV_VAR = ['SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_URL'].find((n) => process.env[n]);
+const SUPABASE_URL = URL_ENV_VAR ? process.env[URL_ENV_VAR].replace(/\/+$/, '') : undefined;
 const KEY_ENV_VARS = ['SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY'];
-const ANON_KEY_ENV_VARS = ['SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY'];
+const ANON_KEY_ENV_VARS = [
+  'SUPABASE_PUBLISHABLE_KEY', 'NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY', 'SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY',
+];
+// Supabase host suffix -> Management API base URL (used for the JIT access probe).
+const MANAGEMENT_APIS = [
+  ['.supabase.red', 'https://api.supabase.green'],
+  ['.supabase.co', 'https://api.supabase.com'],
+];
+const JIT_ROLE = 'postgres';
+const PROBE_TIMEOUT_MS = 5000;
 const PROBE_TABLES = ['countries'];
 const SAFE_CLAIMS = [
   'iss', 'sub', 'aud', 'role', 'exp', 'iat', 'nbf', 'email', 'scope', 'aal', 'is_anonymous',
   'owner', 'owner_id', 'project', 'project_id', 'environment', 'user_id', 'act',
 ];
 const CLIENT_OPTIONS = { auth: { persistSession: false, autoRefreshToken: false } };
+
+function describeSupabaseUrl() {
+  const info = { env_var: URL_ENV_VAR ?? null, valid: false, host: null, project_ref: null, management_api: null };
+  if (!SUPABASE_URL) return info;
+  try {
+    const { host, hostname } = new URL(SUPABASE_URL);
+    const mgmt = MANAGEMENT_APIS.find(([suffix]) => hostname.endsWith(suffix));
+    // The project ref is only derivable from <ref>.supabase.<tld> hosts, not custom domains.
+    Object.assign(info, {
+      valid: true,
+      host,
+      project_ref: mgmt ? hostname.split('.')[0] : null,
+      management_api: mgmt ? mgmt[1] : null,
+    });
+  } catch {}
+  return info;
+}
+
+const SUPABASE_URL_INFO = describeSupabaseUrl();
+
+function makeClient(key, options = CLIENT_OPTIONS) {
+  return SUPABASE_URL_INFO.valid && key ? createClient(SUPABASE_URL, key, options) : null;
+}
 
 function firstEnv(names) {
   const name = names.find((n) => process.env[n]);
@@ -111,7 +145,7 @@ async function resolveServerCredential(req) {
     const resourceId = process.env.MARKETPLACE_RESOURCE_ID;
     const info = {
       auth_path: 'vercel_oidc_marketplace',
-      apikey_env_var: anonKey?.name ?? null,
+      apikey: anonKey ? { env_var: anonKey.name, ...describeKey(anonKey.value) } : null,
       oidc: {
         source: oidc.source,
         jwt_header: jwtHeader(oidc.token),
@@ -135,13 +169,10 @@ async function resolveServerCredential(req) {
       });
       const token = minted.token;
       return {
-        client: createClient(SUPABASE_URL, anonKey?.value, {
-          ...CLIENT_OPTIONS,
-          accessToken: async () => token,
-        }),
+        client: makeClient(anonKey?.value, { ...CLIENT_OPTIONS, accessToken: async () => token }),
         info,
-        // Raw tokens for checks.js signature/size checks; never serialized.
-        ctx: { oidcToken: oidc.token, resourceToken: token },
+        // Raw tokens/keys for probes and checks.js signature/size checks; never serialized.
+        ctx: { oidcToken: oidc.token, resourceToken: token, apikey: anonKey?.value },
       };
     } catch (err) {
       Object.assign(info.resource_token, {
@@ -154,7 +185,7 @@ async function resolveServerCredential(req) {
   }
   const key = firstEnv(KEY_ENV_VARS);
   return {
-    client: createClient(SUPABASE_URL, key?.value, CLIENT_OPTIONS),
+    client: makeClient(key?.value),
     info: {
       auth_path: 'vercel_integration_keys',
       key_env_var: key?.name ?? null,
@@ -179,8 +210,8 @@ async function probeAccess(client) {
 
 async function dbWhoami(client) {
   try {
-    const { data, error } = await client.rpc('whoami_vercel');
-    if (error) return { error_code: error.code || null, error: error.message || null };
+    const { data, error, status } = await client.rpc('whoami_vercel');
+    if (error) return { status: status ?? null, error_code: error.code || null, error: error.message || null };
     return data;
   } catch (err) {
     return { error: err.message };
@@ -194,7 +225,8 @@ async function describeEndUser(req) {
   const result = { present: true, jwt_header: jwtHeader(jwt), claims: safeClaims(decodeJwt(jwt)) };
 
   const key = firstEnv(ANON_KEY_ENV_VARS) || firstEnv(KEY_ENV_VARS);
-  const authClient = createClient(SUPABASE_URL, key?.value, CLIENT_OPTIONS);
+  const authClient = makeClient(key?.value);
+  if (!authClient) return { ...result, authenticated: false, error: 'Supabase URL or key is not configured' };
   try {
     const { data, error } = await authClient.auth.getUser(jwt);
     if (error) throw error;
@@ -215,7 +247,7 @@ async function describeEndUser(req) {
     return result;
   }
 
-  const userClient = createClient(SUPABASE_URL, key?.value, {
+  const userClient = makeClient(key?.value, {
     ...CLIENT_OPTIONS,
     global: { headers: { Authorization: `Bearer ${jwt}` } },
   });
@@ -226,27 +258,113 @@ async function describeEndUser(req) {
   return result;
 }
 
+// Changes the first signature character; the last one carries base64 padding bits, so changing it
+// can decode to the same signature.
+function tamper(token) {
+  const i = token.lastIndexOf('.') + 1;
+  return token.slice(0, i) + (token[i] === 'A' ? 'B' : 'A') + token.slice(i + 1);
+}
+
+// Control requests that show the role comes from the resource token: without it the request must
+// run as anon, and with a tampered signature Supabase must reject it (401 PGRST301).
+async function runControls(ctx) {
+  const apikeyOnly = makeClient(ctx.apikey);
+  const tampered = makeClient(ctx.apikey, { ...CLIENT_OPTIONS, accessToken: async () => tamper(ctx.resourceToken) });
+  const [apikeyOnlyResult, tamperedResult] = await Promise.all([dbWhoami(apikeyOnly), dbWhoami(tampered)]);
+  return { apikey_only: apikeyOnlyResult, tampered_token: tamperedResult };
+}
+
+async function requestJitAccess(token) {
+  const { management_api: mgmt, project_ref: ref } = SUPABASE_URL_INFO;
+  if (!mgmt || !ref) return { skipped: 'Supabase URL is not a <ref>.supabase.co host' };
+  const started = Date.now();
+  try {
+    const res = await fetch(`${mgmt}/v1/projects/${encodeURIComponent(ref)}/database/jit`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ role: JIT_ROLE, rhost: '127.0.0.1' }),
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    const text = await res.text();
+    let body = null;
+    try {
+      body = JSON.parse(text);
+    } catch {}
+    const result = { endpoint: `${mgmt}/v1/projects/${ref}/database/jit`, status: res.status, ms: Date.now() - started };
+    if (res.status === 200) result.role = body?.user_role?.role ?? null;
+    else result.error = (body?.message ?? text).slice(0, 500);
+    return result;
+  } catch (err) {
+    return { status: null, error: err.message, ms: Date.now() - started };
+  }
+}
+
+// Logs in to Postgres with the resource token as the password; the password in POSTGRES_URL is ignored.
+async function loginWithToken(token) {
+  if (!process.env.POSTGRES_URL) return { skipped: 'POSTGRES_URL is not set' };
+  let url;
+  try {
+    url = new URL(process.env.POSTGRES_URL);
+  } catch {
+    return { skipped: 'POSTGRES_URL is not a valid URL' };
+  }
+  const port = Number(url.port) || 5432;
+  const endpoint = `${url.hostname}:${port}`;
+  const client = new Client({
+    host: url.hostname,
+    port,
+    user: decodeURIComponent(url.username),
+    password: token,
+    database: 'postgres',
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 10_000,
+  });
+  client.on('error', () => {});
+  const started = Date.now();
+  try {
+    await client.connect();
+    const { rows } = await client.query('select current_user');
+    return { endpoint, current_user: rows[0].current_user, ms: Date.now() - started };
+  } catch (err) {
+    return { endpoint, error: err.message, ms: Date.now() - started };
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
 async function runDiagnostics(req, res) {
   const server = await resolveServerCredential(req);
-  const skipped = { skipped: 'no Supabase client: resource token could not be minted' };
-  const [serverAccess, serverDbIdentity, endUser] = await Promise.all([
+  const resourceToken = server.ctx?.resourceToken;
+  const skipped = {
+    skipped: !SUPABASE_URL_INFO.valid
+      ? 'no Supabase client: Supabase URL is missing or invalid'
+      : 'no Supabase client: resource token could not be minted',
+  };
+  const noToken = { skipped: 'no resource token' };
+  const [serverAccess, serverDbIdentity, controls, jitApi, jitLogin, endUser] = await Promise.all([
     server.client ? probeAccess(server.client) : skipped,
     server.client ? dbWhoami(server.client) : skipped,
+    server.client && resourceToken ? runControls(server.ctx) : skipped,
+    resourceToken ? requestJitAccess(resourceToken) : noToken,
+    resourceToken ? loginWithToken(resourceToken) : noToken,
     describeEndUser(req),
   ]);
-  let supabaseHost = null;
-  try {
-    supabaseHost = new URL(SUPABASE_URL).host;
-  } catch {}
 
   const data = {
     timestamp: new Date().toISOString(),
     environment: {
       vercel_env: process.env.VERCEL_ENV ?? null,
       vercel_region: process.env.VERCEL_REGION ?? null,
-      supabase_url_host: supabaseHost,
+      supabase_url_host: SUPABASE_URL_INFO.host,
+      supabase_url: SUPABASE_URL_INFO,
     },
-    server_credential: { ...server.info, access: serverAccess, database_identity: serverDbIdentity },
+    server_credential: {
+      ...server.info,
+      access: serverAccess,
+      database_identity: serverDbIdentity,
+      ...(server.info.auth_path === 'vercel_oidc_marketplace' && { controls }),
+    },
+    jit: { management_api: jitApi, postgres_login: jitLogin },
     end_user: endUser,
   };
   const checks = await runChecks(data, server.ctx);

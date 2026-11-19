@@ -10,9 +10,15 @@ const REQUIRED_RESOURCE_CLAIMS = ['aud', 'sub', 'act', 'iat', 'nbf', 'exp'];
 const OIDC_ISS_RE = /^https:\/\/oidc\.vercel\.com(\/[^/]+)?$/;
 const RESOURCE_ISS_RE = /^https:\/\/integrations\.vercel\.com\/(oac_[A-Za-z0-9]+)$/;
 const JWKS_MAX_AGE_MS = 60 * 60 * 1000;
+const SECRET_ENV_VARS = ['SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SECRET_KEY', 'SUPABASE_JWT_SECRET'];
 const STATIC_SECRET_ENV_VARS = [
-  'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SECRET_KEY', 'SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY',
+  ...SECRET_ENV_VARS, 'SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY',
+  'SUPABASE_PUBLISHABLE_KEY', 'NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY',
 ];
+const RESOURCE_ID_RE = /^(store|ir)_/;
+const JIT_ROLE = 'postgres';
+const MISSING_RELATION_CODES = ['PGRST205', '42P01'];
+const MISSING_FUNCTION_CODES = ['PGRST202', '42883'];
 
 const MINT_ERROR_HINTS = {
   not_found: "No matching resource is connected to this project for the deployment's environment.",
@@ -78,6 +84,12 @@ async function verifySignature(token, iss, fetchImpl, now) {
     : fail('valid RS256 signature', 'invalid', `Signature does not verify against kid ${header.kid}.`);
 }
 
+function isSecretValue(value) {
+  if (typeof value !== 'string') return false;
+  if (value.startsWith('sb_secret_')) return true;
+  return decodeJwtPart(value, 1)?.role === 'service_role';
+}
+
 function parseMintErrorCode(body) {
   try {
     const parsed = JSON.parse(body);
@@ -105,6 +117,9 @@ function buildContext(data, ctx, env, nowMs) {
     res: resRaw ?? sc.resource_token?.claims ?? null,
     resourceToken: ctx?.resourceToken ?? null,
     db: sc.database_identity ?? null,
+    url: data.environment?.supabase_url ?? null,
+    controls: sc.controls ?? null,
+    jit: data.jit ?? null,
   };
 }
 
@@ -114,7 +129,49 @@ const needResource = (c) => notOidc(c) || (c.minted && c.res ? null : skip('No r
 const needDb = (c) =>
   needResource(c) || (c.db && !c.db.skipped ? null : skip('database_identity was not queried.'));
 
+const isSkipped = (r) => !r || r.skipped;
+
 const CHECKS = [
+  {
+    id: 'supabase_url',
+    group: 'config',
+    description: 'SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) is set to a valid URL',
+    run: (c) => {
+      if (!c.url?.env_var) return fail('set', null, 'Set SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL).');
+      if (!c.url.valid) return fail('valid URL', c.url.env_var, 'Set it to https://<project ref>.supabase.co.');
+      return pass('valid URL', { env_var: c.url.env_var, host: c.url.host, project_ref: c.url.project_ref });
+    },
+  },
+  {
+    id: 'apikey_public',
+    group: 'config',
+    description: 'The apikey header carries only a publishable or anon key (the token sets the role)',
+    run: (c) => {
+      const s = notOidc(c);
+      if (s) return s;
+      const k = c.sc.apikey;
+      const expected = 'publishable or anon key';
+      if (!k) return fail(expected, null, 'Set SUPABASE_PUBLISHABLE_KEY to the project\'s publishable key (it is a public key).');
+      if (k.key_format === 'sb_secret' || k.role === 'service_role') {
+        return fail(expected, k, `${k.env_var} holds a secret key; put the publishable key there and remove the secret.`);
+      }
+      if (k.key_format === 'unknown') return warn(expected, k, 'Unrecognized key format.');
+      return pass(expected, k);
+    },
+  },
+  {
+    id: 'resource_id',
+    group: 'config',
+    description: 'MARKETPLACE_RESOURCE_ID is set to a Vercel resource id (store_… or ir_…)',
+    run: (c) => {
+      const s = notOidc(c);
+      if (s) return s;
+      const id = c.env.MARKETPLACE_RESOURCE_ID;
+      const hint = 'Find it in the Vercel dashboard under Storage → the Supabase resource; the id is in the page URL.';
+      if (!id) return fail('store_… or ir_…', null, `MARKETPLACE_RESOURCE_ID is not set. ${hint}`);
+      return RESOURCE_ID_RE.test(id) ? pass('store_… or ir_…', id) : warn('store_… or ir_…', id, hint);
+    },
+  },
   {
     id: 'auth_path',
     group: 'path',
@@ -130,8 +187,12 @@ const CHECKS = [
     description: 'No long-lived Supabase secret keys are present (oidc-only resources have no static secrets)',
     run: (c) => {
       const present = STATIC_SECRET_ENV_VARS.filter((n) => c.env[n]);
-      const secret = present.filter((n) => n === 'SUPABASE_SERVICE_ROLE_KEY' || n === 'SUPABASE_SECRET_KEY' || c.env[n].startsWith('sb_secret_'));
-      if (secret.length) return warn('no secret key env vars', secret, 'A service-role/secret key is still configured.');
+      // Names only; also catches secret keys stored under other env var names.
+      const secret = [...new Set([
+        ...SECRET_ENV_VARS.filter((n) => c.env[n]),
+        ...Object.keys(c.env).filter((n) => isSecretValue(c.env[n])),
+      ])].sort();
+      if (secret.length) return warn('no secret key env vars', secret, 'A service-role/secret key or JWT secret is still configured.');
       return pass('no secret key env vars', present.length ? `only public keys: ${present.join(', ')}` : 'none');
     },
   },
@@ -192,6 +253,21 @@ const CHECKS = [
         return warn({ environment: c.env.VERCEL_ENV }, actual, 'Token environment differs from VERCEL_ENV.');
       }
       return pass('owner, project, environment present', actual);
+    },
+  },
+  {
+    id: 'oidc_team',
+    group: 'vercel_oidc',
+    description: 'VERCEL_TEAM_ID, if set, matches the OIDC token owner_id',
+    run: (c) => {
+      const s = needOidc(c);
+      if (s) return s;
+      const team = c.env.VERCEL_TEAM_ID;
+      if (!team) return skip('VERCEL_TEAM_ID is not set.');
+      if (!c.oidc.owner_id) return warn(team, null, 'OIDC token has no owner_id claim.');
+      return team === c.oidc.owner_id
+        ? pass(team, c.oidc.owner_id)
+        : warn(team, c.oidc.owner_id, 'Remove VERCEL_TEAM_ID, or set it to the team that owns the resource.');
     },
   },
   {
@@ -273,6 +349,20 @@ const CHECKS = [
       if (!c.res.sub) return fail(expected ?? 'present', null);
       if (expected) return c.res.sub === expected ? pass(expected, c.res.sub) : fail(expected, c.res.sub);
       return warn('<SUPABASE_RESOURCE_ID>', c.res.sub, 'Set SUPABASE_RESOURCE_ID to check the exact resource.');
+    },
+  },
+  {
+    id: 'resource_sub_project',
+    group: 'resource_token',
+    description: 'Resource token subject is the project ref in SUPABASE_URL',
+    run: (c) => {
+      const s = needResource(c);
+      if (s) return s;
+      const ref = c.url?.project_ref;
+      if (!ref) return skip('SUPABASE_URL is not a <ref>.supabase.co host (custom domain?).');
+      return c.res.sub === ref
+        ? pass(ref, c.res.sub)
+        : fail(ref, c.res.sub ?? null, 'MARKETPLACE_RESOURCE_ID and SUPABASE_URL point to different Supabase projects.');
     },
   },
   {
@@ -388,7 +478,9 @@ const CHECKS = [
       const detail =
         c.db.error_code === 'PGRST301'
           ? `Supabase has no key for this token. Add Third-Party Auth → Custom OIDC with issuer ${c.res.iss}.`
-          : c.db.error;
+          : MISSING_FUNCTION_CODES.includes(c.db.error_code)
+            ? 'public.whoami_vercel() does not exist; apply the migration in supabase/migrations.'
+            : c.db.error;
       return fail('accepted', c.db.error_code ?? c.db.error, detail);
     },
   },
@@ -430,6 +522,92 @@ const CHECKS = [
       if (s) return s;
       if (c.db.error) return skip('Supabase rejected the token.');
       return c.db.bypasses_rls === false ? pass(false, false) : fail(false, c.db.bypasses_rls ?? null);
+    },
+  },
+  {
+    id: 'db_table_access',
+    group: 'database',
+    description: 'Probe tables (public.countries) can be read with the resource token',
+    run: (c) => {
+      const s = needResource(c);
+      if (s) return s;
+      const access = c.sc.access;
+      if (!Array.isArray(access)) return skip(access?.skipped ?? 'Tables were not probed.');
+      const denied = access.filter((t) => !t.allowed);
+      const actual = Object.fromEntries(access.map((t) => [t.table, t.allowed ? `${t.row_count} rows` : t.error_code ?? t.error]));
+      if (!denied.length) return pass('readable', actual);
+      const missing = denied.filter((t) => MISSING_RELATION_CODES.includes(t.error_code)).map((t) => `public.${t.table}`);
+      return fail('readable', actual, missing.length ? `Missing: ${missing.join(', ')}; create it.` : denied[0].error);
+    },
+  },
+  {
+    id: 'db_anon_control',
+    group: 'database',
+    description: 'Control: without the resource token (apikey only) the request runs as anon',
+    run: (c) => {
+      const s = needDb(c);
+      if (s) return s;
+      const r = c.controls?.apikey_only;
+      if (isSkipped(r)) return skip(r?.skipped ?? 'Control was not run.');
+      if (r.error) return fail('anon', r.error_code ?? r.error, r.error);
+      if (r.current_user !== 'anon') {
+        return fail('anon', r.current_user ?? null, 'The apikey alone grants a non-anon role; use a publishable or anon key.');
+      }
+      if (!c.db.error && c.db.current_user === r.current_user) {
+        return fail('differs from token role', r.current_user, 'Same role with and without the token, so the role is not coming from the token.');
+      }
+      return pass('anon', r.current_user);
+    },
+  },
+  {
+    id: 'db_tampered_rejected',
+    group: 'database',
+    description: 'Control: Supabase rejects the resource token with a tampered signature (401 PGRST301)',
+    run: (c) => {
+      const s = needResource(c);
+      if (s) return s;
+      const r = c.controls?.tampered_token;
+      const expected = { status: 401, error_code: 'PGRST301' };
+      if (isSkipped(r)) return skip(r?.skipped ?? 'Control was not run.');
+      if (!r.error) return fail(expected, { accepted: true, current_user: r.current_user ?? null }, 'Supabase accepted a token with a broken signature.');
+      const actual = { status: r.status ?? null, error_code: r.error_code ?? null };
+      return actual.status === 401 && actual.error_code === 'PGRST301' ? pass(expected, actual) : fail(expected, actual, r.error);
+    },
+  },
+  {
+    id: 'jit_management_api',
+    group: 'jit',
+    description: `Management API grants JIT database access (${JIT_ROLE}) for the resource token`,
+    run: (c) => {
+      const s = needResource(c);
+      if (s) return s;
+      const r = c.jit?.management_api;
+      if (!r) return skip('JIT access was not requested.');
+      if (r.skipped) return warn('HTTP 200', null, r.skipped);
+      if (r.status === 200) return pass(`HTTP 200, role ${JIT_ROLE}`, { status: r.status, role: r.role ?? null, ms: r.ms });
+      return fail(`HTTP 200, role ${JIT_ROLE}`, { status: r.status ?? null, error: r.error ?? null },
+        'Check that JIT access is enabled for the project (needs an Owner or Admin to enable).');
+    },
+  },
+  {
+    id: 'jit_postgres_login',
+    group: 'jit',
+    description: `Postgres login through POSTGRES_URL's host with the resource token as the password runs as ${JIT_ROLE}`,
+    run: (c) => {
+      const s = needResource(c);
+      if (s) return s;
+      const r = c.jit?.postgres_login;
+      const expected = `current_user = ${JIT_ROLE}`;
+      if (!r) return skip('Postgres login was not attempted.');
+      if (r.skipped) return fail(expected, null, r.skipped);
+      if (r.error) {
+        const ref = c.url?.project_ref ?? '<ref>';
+        return fail(expected, { endpoint: r.endpoint, error: r.error },
+          `Check that JIT access is enabled for the project (GET /v1/projects/${ref}/jit-access, needs Owner or Admin).`);
+      }
+      return r.current_user === JIT_ROLE
+        ? pass(expected, { endpoint: r.endpoint, current_user: r.current_user, ms: r.ms })
+        : fail(expected, { endpoint: r.endpoint, current_user: r.current_user });
     },
   },
 ];
