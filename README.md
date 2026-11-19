@@ -1,5 +1,5 @@
-# supabase-hello-world
-## `GET /api/diagnostics`
+# supabase-vercel-secretless-daignostics
+## `GET /`
 
 Returns JSON (non-secret) shaped as `{ "data": {...}, "checks": {...} }`. Always HTTP 200.
 

@@ -257,7 +257,7 @@ async function handleDiagnostics(req, res) {
 
 const server = http.createServer(async (req, res) => {
   const path = req.url.split('?')[0];
-  if (path === '/api/diagnostics' && req.method === 'GET') {
+  if (path === '/' && req.method === 'GET') {
     try {
       await handleDiagnostics(req, res);
     } catch (error) {
@@ -265,50 +265,9 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify({ error: error.message }));
     }
-  } else if (req.url === '/api/countries' && req.method === 'GET') {
-    try {
-      const { client: supabase, error: credentialError } = await resolveServerCredential(req);
-      if (credentialError) throw credentialError;
-      const { data: rows, error } = await supabase
-        .from('countries')
-        .select('name')
-        .order('name');
-      if (error) throw error;
-      const html = `
-        <!DOCTYPE html>
-        <html>
-          <head>
-            <title>Countries</title>
-            <style>
-              body { font-family: Arial, sans-serif; padding: 20px; }
-              table { border-collapse: collapse; width: 100%; max-width: 600px; }
-              th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-              th { background-color: #f2f2f2; }
-            </style>
-          </head>
-          <body>
-            <h1>Countries</h1>
-            <table>
-              <thead>
-                <tr><th>Name</th></tr>
-              </thead>
-              <tbody>
-                ${rows.map(row => `<tr><td>${row.name}</td></tr>`).join('')}
-              </tbody>
-            </table>
-          </body>
-        </html>
-      `;
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(html);
-    } catch (error) {
-      console.error('Database query error:', error);
-      res.writeHead(500, { 'Content-Type': 'text/html' });
-      res.end(`<h1>Error</h1><p>${error.message}</p>`);
-    }
   } else {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end('<h1>hhello    world!!!!1 wooo!!1!!</h1>');
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
   }
 });
 
