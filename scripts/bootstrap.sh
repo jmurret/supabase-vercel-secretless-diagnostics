@@ -8,7 +8,8 @@
 # shows that public.whoami_vercel() and public.countries already exist. It needs the token.
 # Step 4 offers to enable the Supabase IPv4 add-on when db.<project host> has no A record.
 # Step 5 enables JIT with scripts/enable-jit.sh.
-# A failure in step 4 or 5 only prints a warning.
+# Step 6 redeploys production.
+# A failure in step 4, 5 or 6 only prints a warning.
 # Needs: vercel CLI, node, curl. Run `vercel link` once before.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -59,6 +60,7 @@ Changes in $environments:
           ${hl}Static secrets can authenticate without OIDC, so we remove them to ensure only OIDC is used.${reset}
   replace .env.local with the Development variables
   enable  JIT access (SSL enforcement + JIT) on the Supabase project
+  redeploy production
 EOF
 if [ -t 0 ]; then
   read -r -p "Continue? [y/N] " answer
@@ -209,4 +211,18 @@ elif ! bash scripts/enable-jit.sh </dev/null; then
 fi
 
 echo >&2
-echo "Redeploy so existing deployments get the changes." >&2
+echo "==> Step 6: Redeploy production" >&2
+# A deployment only sees the variables that existed when it was built.
+redeploy_warning() {
+  echo "WARNING: Production was not redeployed. $1" >&2
+  echo "Run \`vercel redeploy <production deployment url> --environment production\` later." >&2
+}
+scope=""
+case "$org_id" in team_*) scope="&teamId=$org_id" ;; esac
+dep_url="$(vercel api -X GET "/v6/deployments?projectId=$project_id&target=production&state=READY&limit=1$scope" --raw 2>/dev/null |
+  node -e 'try { const d = (JSON.parse(require("fs").readFileSync(0, "utf8")).deployments || [])[0]; if (d) console.log(d.url); } catch {}')" || dep_url=""
+if [ -z "$dep_url" ]; then
+  redeploy_warning "Could not find a Ready production deployment."
+elif ! vercel redeploy "$dep_url" --environment production; then
+  redeploy_warning "The Vercel CLI failed."
+fi
