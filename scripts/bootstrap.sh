@@ -7,12 +7,10 @@
 # SUPABASE_ACCESS_TOKEN). Press Enter to skip it. See scripts/lib.sh.
 # Step 3 applies supabase/migrations through the Management API, unless the Data API
 # shows that public.whoami_vercel() and public.countries already exist.
-# Step 4 sets SUPABASE_POOLER_HOST, SUPABASE_POOLER_PORT and SUPABASE_POOLER_USER (no password)
-# from the Management API, for the JIT pooler login checks.
-# Step 5 offers to enable the Supabase IPv4 add-on when db.<project host> has no A record.
-# Step 6 enables JIT with scripts/enable-jit.sh.
-# Step 7 redeploys production.
-# A failure in step 4, 5, 6 or 7 only prints a warning.
+# Step 4 offers to enable the Supabase IPv4 add-on when db.<project host> has no A record.
+# Step 5 enables JIT with scripts/enable-jit.sh.
+# Step 6 redeploys production.
+# A failure in step 4, 5 or 6 only prints a warning.
 # Needs: vercel CLI, node, curl. Run `vercel link` once before.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -64,7 +62,6 @@ Changes in $environments:
   remove  ${secrets[*]}
           ${hl}Static secrets can authenticate without OIDC, so we remove them to ensure only OIDC is used.${reset}
   replace .env.local with the Development variables
-  set     SUPABASE_POOLER_HOST, SUPABASE_POOLER_PORT, SUPABASE_POOLER_USER (no password)
   enable  JIT access (SSL enforcement + JIT) on the Supabase project
   redeploy production
 EOF
@@ -96,6 +93,9 @@ EOF
     exit 1
     ;;
 esac
+for name in POSTGRES_POOLER_HOST SUPABASE_PROJECT_REF; do
+  [ -n "$(env_value "$name")" ] || echo "Warning: $name is not set. The JIT pooler login checks need it from the Supabase integration." >&2
+done
 [ -n "$(env_value VERCEL_OIDC_TOKEN)" ] || echo "Warning: VERCEL_OIDC_TOKEN is not in .env.local. Enable OIDC Federation (Secure backend access) in the Vercel project settings." >&2
 
 echo >&2
@@ -105,7 +105,7 @@ key="$(env_value SUPABASE_PUBLISHABLE_KEY NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY S
 mint_resource_token
 export SUPABASE_RESOURCE_TOKEN
 [ -z "${SUPABASE_ACCESS_TOKEN:-}" ] || echo "SUPABASE_ACCESS_TOKEN is set. It is used only if the Management API rejects the resource token." >&2
-has_mgmt_credential || echo "No Management API credential. The schema, pooler, IPv4 add-on and JIT steps cannot make changes." >&2
+has_mgmt_credential || echo "No Management API credential. The schema, IPv4 add-on and JIT steps cannot make changes." >&2
 
 echo >&2
 echo "==> Step 3: Supabase schema" >&2
@@ -131,38 +131,7 @@ else
 fi
 
 echo >&2
-echo "==> Step 4: Pooler connection settings" >&2
-# The JIT pooler login reads these instead of POSTGRES_URL, which holds a static password.
-pooler_warning() {
-  echo "WARNING: Pooler settings not set; the JIT pooler login checks are skipped. $1" >&2
-}
-mgmt_api GET config/database/pooler
-if ! mgmt_ok; then
-  pooler_warning "GET config/database/pooler: HTTP $MGMT_STATUS $MGMT_BODY"
-elif ! pooler="$(printf '%s' "$MGMT_BODY" | node -e '
-  const all = JSON.parse(require("fs").readFileSync(0, "utf8"));
-  const p = (Array.isArray(all) ? all : [all]).find((x) => x.database_type === "PRIMARY") || all[0];
-  if (!p?.db_host || !p?.db_port || !p?.db_user) process.exit(1);
-  console.log([p.db_host, p.db_port, p.db_user].join("\t"));
-')"; then
-  pooler_warning "The response has no db_host, db_port and db_user."
-else
-  IFS=$'\t' read -r pooler_host pooler_port pooler_user <<<"$pooler"
-  if [ "$(env_value SUPABASE_POOLER_HOST)" = "$pooler_host" ] &&
-    [ "$(env_value SUPABASE_POOLER_PORT)" = "$pooler_port" ] &&
-    [ "$(env_value SUPABASE_POOLER_USER)" = "$pooler_user" ]; then
-    echo "Pooler settings are up to date ($pooler_user@$pooler_host:$pooler_port). Skipped." >&2
-  else
-    vercel env add SUPABASE_POOLER_HOST --environment "$environments" --value "$pooler_host" --type config --force --yes
-    vercel env add SUPABASE_POOLER_PORT --environment "$environments" --value "$pooler_port" --type config --force --yes
-    vercel env add SUPABASE_POOLER_USER --environment "$environments" --value "$pooler_user" --type config --force --yes
-    vercel env pull .env.local --yes
-    echo "Set the pooler settings ($pooler_user@$pooler_host:$pooler_port)." >&2
-  fi
-fi
-
-echo >&2
-echo "==> Step 5: IPv4 address for the direct database host" >&2
+echo "==> Step 4: IPv4 address for the direct database host" >&2
 ipv4_warning() {
   echo "WARNING: IPv4 add-on not enabled. $1" >&2
   cat >&2 <<EOF
@@ -195,7 +164,7 @@ else
 fi
 
 echo >&2
-echo "==> Step 6: JIT access" >&2
+echo "==> Step 5: JIT access" >&2
 jit_warning() {
   echo "WARNING: JIT is not enabled; the JIT checks will fail. $1" >&2
   echo "Run \`pnpm run enable-jit\` later (needed until CTRL-2145/CTRL-2146)." >&2
@@ -207,7 +176,7 @@ elif ! bash scripts/enable-jit.sh </dev/null; then
 fi
 
 echo >&2
-echo "==> Step 7: Redeploy production" >&2
+echo "==> Step 6: Redeploy production" >&2
 # A deployment only sees the variables that existed when it was built.
 redeploy_warning() {
   echo "WARNING: Production was not redeployed. $1" >&2

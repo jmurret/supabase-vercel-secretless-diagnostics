@@ -16,6 +16,7 @@ const MANAGEMENT_APIS = [
   ['.supabase.co', 'https://api.supabase.com'],
 ];
 const JIT_ROLE = 'postgres';
+const POOLER_PORT = 6543;
 const PROBE_TIMEOUT_MS = 5000;
 const PROBE_TABLES = ['countries'];
 const SAFE_CLAIMS = [
@@ -318,26 +319,27 @@ async function requestJitAccess(token) {
   }
 }
 
-// Logs in to Postgres with the resource token as the password. Without an explicit host, host, port
-// and user come from SUPABASE_POOLER_HOST/PORT/USER (set by `pnpm run bootstrap`); no static password is used.
+// Logs in to Postgres with the resource token as the password; no static password is used. Without an
+// explicit host, it uses the pooler: postgres://<role>.<SUPABASE_PROJECT_REF>:<token>@<POSTGRES_POOLER_HOST>:6543,
+// where <role> is the token's role claim (port 6543 = transaction mode).
 async function loginWithToken(token, { host, port, user, options, servername, endpoint, timeoutMs = 10_000 } = {}) {
   if (!host) {
-    const { SUPABASE_POOLER_HOST, SUPABASE_POOLER_PORT, SUPABASE_POOLER_USER } = process.env;
-    if (!SUPABASE_POOLER_HOST || !SUPABASE_POOLER_USER) {
-      return { skipped: 'SUPABASE_POOLER_HOST or SUPABASE_POOLER_USER is not set: run `pnpm run bootstrap`' };
+    const ref = process.env.SUPABASE_PROJECT_REF || SUPABASE_URL_INFO.project_ref;
+    if (!process.env.POSTGRES_POOLER_HOST || !ref) {
+      return { skipped: 'POSTGRES_POOLER_HOST or SUPABASE_PROJECT_REF is not set (Supabase integration variables)' };
     }
-    host = SUPABASE_POOLER_HOST;
-    port = Number(SUPABASE_POOLER_PORT) || 5432;
-    user = SUPABASE_POOLER_USER;
+    host = process.env.POSTGRES_POOLER_HOST;
+    port = POOLER_PORT;
+    user = `${decodeJwt(token)?.role ?? JIT_ROLE}.${ref}`;
   }
-  endpoint ??= `${host}:${port}`;
+  endpoint ??= `${user}@${host}:${port}`;
   const client = new Client({
     host,
     port,
     user,
     password: token,
     ...(options && { options }),
-    database: 'postgres',
+    database: process.env.POSTGRES_DATABASE || 'postgres',
     ssl: { rejectUnauthorized: false, ...(servername && { servername }) },
     connectionTimeoutMillis: timeoutMs,
   });

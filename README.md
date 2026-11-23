@@ -11,7 +11,7 @@ Use a Vercel project that has the Supabase Marketplace integration. Then do thes
    - Replaces `.env.local` with the Development variables. It warns if `VERCEL_OIDC_TOKEN` is not set.
    - Calls the Supabase Management API with a resource token (role `postgres`) minted from `VERCEL_OIDC_TOKEN`, so no static secret is needed. If the Management API rejects that token (HTTP 401/403), the script asks once for a Supabase access token. Use an experimental API token. The token is hidden and is not saved. Press Enter to skip it, or set `SUPABASE_ACCESS_TOKEN` to skip the prompt. See [`scripts/lib.sh`](./scripts/lib.sh).
    - Applies the files in `supabase/migrations` (`public.whoami_vercel()` and `public.countries`) when the schema is missing.
-   - Sets `SUPABASE_POOLER_HOST`, `SUPABASE_POOLER_PORT` and `SUPABASE_POOLER_USER` (no password) from the Management API pooler settings. The JIT pooler login checks use them instead of `POSTGRES_URL`.
+   - Warns if `POSTGRES_POOLER_HOST` or `SUPABASE_PROJECT_REF` is not set. The JIT pooler login checks need them.
    - Offers to enable the Supabase IPv4 add-on when `db.<project host>` has no IPv4 address. The add-on is paid. Without it, the direct login check is skipped on Vercel. If the request fails, the script only prints a warning and the manual command.
    - Enables JIT access and SSL enforcement with the same credential, until CTRL-2145 and CTRL-2146 are done. If this fails or you skipped the token, the script only prints a warning. Then run `pnpm run enable-jit`. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
    - Redeploys the latest Ready production deployment, because a deployment only sees the variables that existed when it was built. If this fails, the script only prints a warning and the manual command.
@@ -52,8 +52,8 @@ and deployable as a Vercel function). Returns JSON (non-secret) shaped as `{ "da
   `management_api` is `POST <management api>/v1/projects/<ref>/database/jit` (role `postgres`).
   `management_api_default_role` is the same request with the default-role (`service_role`) token.
   It is a control: the Management API must reject it, because the token role is not `postgres`.
-  `postgres_login` logs in to `SUPABASE_POOLER_HOST`/`SUPABASE_POOLER_PORT`/`SUPABASE_POOLER_USER`
-  (set by `pnpm run bootstrap`) with the JIT token as the password and the startup option `--jit=true`.
+  `postgres_login` logs in through the pooler with the JIT token as the password and the startup option
+  `--jit=true`. See [Connect to Postgres](#connect-to-postgres).
   `postgres_login_no_jit` is the same login without the option. `direct_login` logs in as `postgres`
   to `db.<project host>`. It uses the IPv4 address when the host has one (Supabase IPv4 add-on),
   and the IPv6 address otherwise. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
@@ -110,6 +110,25 @@ Optional env vars for exact matches (otherwise the check only validates the form
 - `VERCEL_INTEGRATION_ID` (`oac_…`) → expected `iss` = `https://integrations.vercel.com/<id>`
 - `VERCEL_INTEGRATION_INSTALLATION_ID` (`icfg_…`) → expected `aud`
 - `SUPABASE_RESOURCE_ID` → expected `sub`
+
+## Connect to Postgres
+
+Unless you've [enabled IPv4](https://supabase.com/docs/guides/platform/ipv4-address) in your Supabase project,
+connect through the pooler, not the direct database host. The direct host is IPv6 only by default, and Vercel
+Functions can't reach it.
+
+- Use a minted resource token as the password. No static database password is needed.
+- Add the startup option `--jit=true`. Without it, login fails with `password authentication failed` (known gap, CTRL-2151).
+- `<role>` is the same role as the token's `role` claim.
+
+```
+postgres://<role>.${SUPABASE_PROJECT_REF}:<token>@${POSTGRES_POOLER_HOST}:6543/${POSTGRES_DATABASE}?sslmode=require&options=--jit%3Dtrue
+```
+
+- Use port `6543` for transaction mode, or port `5432` for session mode.
+- For Prisma in transaction mode, also add `&pgbouncer=true`.
+
+The `jit_postgres_login` checks connect this way, in transaction mode (port `6543`).
 
 ## Enable JIT by hand (temporary)
 

@@ -653,7 +653,7 @@ const CHECKS = [
   {
     id: 'jit_postgres_login',
     group: 'jit',
-    description: `Postgres login through the pooler (SUPABASE_POOLER_HOST) with the JIT token as the password and the --jit=true option runs as ${JIT_ROLE}`,
+    description: `Postgres login through the pooler (<role>.SUPABASE_PROJECT_REF@POSTGRES_POOLER_HOST:6543) with the JIT token as the password and the --jit=true option runs as ${JIT_ROLE}`,
     run: (c) => {
       const s = needJitToken(c);
       if (s) return s;
@@ -670,7 +670,7 @@ const CHECKS = [
   {
     id: 'jit_postgres_login_no_jit',
     group: 'jit',
-    description: `Postgres login through the pooler (SUPABASE_POOLER_HOST) with the JIT token as the password and without the --jit=true option (CTRL-2151)`,
+    description: `Postgres login through the pooler (<role>.SUPABASE_PROJECT_REF@POSTGRES_POOLER_HOST:6543) with the JIT token as the password and without the --jit=true option (CTRL-2151)`,
     run: (c) => {
       const s = needJitToken(c);
       if (s) return s;

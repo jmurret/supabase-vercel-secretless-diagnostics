@@ -16,13 +16,14 @@ env_value() {
   done | head -n 1
 }
 
-# Sets url, host, ref, mgmt and dashboard from SUPABASE_URL in .env.local.
+# Sets url, host, ref, mgmt and dashboard from SUPABASE_URL (and SUPABASE_PROJECT_REF) in .env.local.
 load_supabase_project() {
   url="$(env_value SUPABASE_URL NEXT_PUBLIC_SUPABASE_URL)"
   url="${url%/}"
   host="${url#*://}"
   host="${host%%/*}"
-  ref="${host%%.*}"
+  ref="$(env_value SUPABASE_PROJECT_REF)"
+  ref="${ref:-${host%%.*}}"
   [ -n "$ref" ] || { echo "SUPABASE_URL is not in .env.local." >&2; return 1; }
   case "$host" in
     *.supabase.red) mgmt=https://api.supabase.green dashboard=https://supabase.green/dashboard ;;
