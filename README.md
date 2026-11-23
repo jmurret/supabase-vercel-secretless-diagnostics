@@ -31,7 +31,7 @@ and deployable as a Vercel function). Returns JSON (non-secret) shaped as `{ "da
   - `auth_path: "vercel_oidc_marketplace"` when a Vercel OIDC token is available
     (`x-vercel-oidc-token` header, falling back to `getVercelOidcToken()` from
     `@vercel/functions/oidc`). The OIDC token is exchanged for a Marketplace resource token via
-    `POST https://api.vercel.com/v1/integrations/marketplace/resources/<MARKETPLACE_RESOURCE_ID>/token`,
+    `POST https://api.vercel.com/v1/integrations/resources/<MARKETPLACE_RESOURCE_ID>/token`,
     and that resource token is sent to Supabase. Both tokens' headers (`alg`, `kid`) and safe
     claims are shown under `oidc` and `resource_token`, plus mint errors (status/body) if the
     exchange fails. Minted tokens are cached until a minute before they expire. `apikey` describes

@@ -119,7 +119,7 @@ async function mintResourceToken(resourceId, oidcToken) {
     return { ...cached, cached: true };
   }
   const res = await fetch(
-    `https://api.vercel.com/v1/integrations/marketplace/resources/${encodeURIComponent(resourceId)}/token`,
+    `https://api.vercel.com/v1/integrations/resources/${encodeURIComponent(resourceId)}/token`,
     {
       method: 'POST',
       headers: { Authorization: `Bearer ${oidcToken}`, 'content-type': 'application/json' },
