@@ -112,14 +112,17 @@ const resourceTokenCache = new Map();
 const TOKEN_REFRESH_MARGIN_MS = 60_000;
 
 // Exchanges the deployment's Vercel OIDC token for a Marketplace resource token that the
-// Supabase resource trusts. Cached until shortly before it expires.
-async function mintResourceToken(resourceId, oidcToken) {
-  const cached = resourceTokenCache.get(resourceId);
+// Supabase resource trusts. Cached until shortly before it expires. Without a role, Vercel issues
+// the resource's default role (service_role); with one, it issues a token for that role.
+async function mintResourceToken(resourceId, oidcToken, role) {
+  const cacheKey = `${resourceId}:${role ?? ''}`;
+  const cached = resourceTokenCache.get(cacheKey);
   if (cached && cached.expiresAt - TOKEN_REFRESH_MARGIN_MS > Date.now()) {
     return { ...cached, cached: true };
   }
+  const query = role ? `?role=${encodeURIComponent(role)}` : '';
   const res = await fetch(
-    `https://api.vercel.com/v1/integrations/marketplace/resources/${encodeURIComponent(resourceId)}/token`,
+    `https://api.vercel.com/v1/integrations/resources/${encodeURIComponent(resourceId)}/token${query}`,
     {
       method: 'POST',
       headers: { Authorization: `Bearer ${oidcToken}`, 'content-type': 'application/json' },
@@ -133,8 +136,29 @@ async function mintResourceToken(resourceId, oidcToken) {
   if (!minted?.token) throw new MintError('mint response did not include a token');
   const expiresAt = minted.expiresAt ?? Date.now() + (minted.expiresIn ?? 0) * 1000;
   const entry = { token: minted.token, tokenType: minted.tokenType ?? 'bearer', expiresAt };
-  resourceTokenCache.set(resourceId, entry);
+  resourceTokenCache.set(cacheKey, entry);
   return { ...entry, cached: false };
+}
+
+// Mints a resource token and describes it for the response. Never throws: on a failed mint it
+// returns the error and its description instead of a token.
+async function mintAndDescribe(resourceId, oidcToken, role) {
+  try {
+    const minted = await mintResourceToken(resourceId, oidcToken, role);
+    return {
+      token: minted.token,
+      fields: {
+        cached: minted.cached,
+        token_type: minted.tokenType,
+        expires_at: new Date(minted.expiresAt).toISOString(),
+        expires_in_s: Math.round((minted.expiresAt - Date.now()) / 1000),
+        jwt_header: jwtHeader(minted.token),
+        claims: safeClaims(decodeJwt(minted.token)),
+      },
+    };
+  } catch (err) {
+    return { error: err, fields: { error: err.message, status: err.status ?? null, response_body: err.body ?? null } };
+  }
 }
 
 // Uses a Marketplace resource token (minted from the Vercel OIDC token) when an OIDC token is
@@ -158,31 +182,15 @@ async function resolveServerCredential(req) {
       info.resource_token.error = 'MARKETPLACE_RESOURCE_ID is not set';
       return { client: null, info, ctx: { oidcToken: oidc.token }, error: new MintError(info.resource_token.error) };
     }
-    try {
-      const minted = await mintResourceToken(resourceId, oidc.token);
-      Object.assign(info.resource_token, {
-        cached: minted.cached,
-        token_type: minted.tokenType,
-        expires_at: new Date(minted.expiresAt).toISOString(),
-        expires_in_s: Math.round((minted.expiresAt - Date.now()) / 1000),
-        jwt_header: jwtHeader(minted.token),
-        claims: safeClaims(decodeJwt(minted.token)),
-      });
-      const token = minted.token;
-      return {
-        client: makeClient(anonKey?.value, { ...CLIENT_OPTIONS, accessToken: async () => token }),
-        info,
-        // Raw tokens/keys for probes and checks.js signature/size checks; never serialized.
-        ctx: { oidcToken: oidc.token, resourceToken: token, apikey: anonKey?.value },
-      };
-    } catch (err) {
-      Object.assign(info.resource_token, {
-        error: err.message,
-        status: err.status ?? null,
-        response_body: err.body ?? null,
-      });
-      return { client: null, info, ctx: { oidcToken: oidc.token }, error: err };
-    }
+    const { token, fields, error } = await mintAndDescribe(resourceId, oidc.token);
+    Object.assign(info.resource_token, fields);
+    if (!token) return { client: null, info, ctx: { oidcToken: oidc.token }, error };
+    return {
+      client: makeClient(anonKey?.value, { ...CLIENT_OPTIONS, accessToken: async () => token }),
+      info,
+      // Raw tokens/keys for probes and checks.js signature/size checks; never serialized.
+      ctx: { oidcToken: oidc.token, resourceToken: token, apikey: anonKey?.value },
+    };
   }
   const key = firstEnv(KEY_ENV_VARS);
   return {
@@ -193,6 +201,16 @@ async function resolveServerCredential(req) {
       ...(key ? describeKey(key.value) : { key_format: null, role: null }),
     },
   };
+}
+
+// The Management API and the Postgres logins need a token whose role claim equals the requested
+// JIT role, so this mints a separate token with that role. The default-role token is not used here.
+async function resolveJitCredential(server) {
+  const oidcToken = server.ctx?.oidcToken;
+  const resourceId = server.info?.resource_token?.resource_id;
+  if (!oidcToken || !resourceId) return { info: { skipped: 'no OIDC token or resource id' } };
+  const { token, fields } = await mintAndDescribe(resourceId, oidcToken, JIT_ROLE);
+  return { token, info: { role: JIT_ROLE, ...fields } };
 }
 
 async function probeAccess(client) {
@@ -366,21 +384,26 @@ async function loginDirect(token, hostname) {
 async function runDiagnostics(req, res) {
   const server = await resolveServerCredential(req);
   const resourceToken = server.ctx?.resourceToken;
+  const jit = await resolveJitCredential(server);
+  const jitToken = jit.token;
+  const noToken = { skipped: 'no resource token' };
   const skipped = {
     skipped: !SUPABASE_URL_INFO.valid
       ? 'no Supabase client: Supabase URL is missing or invalid'
       : 'no Supabase client: resource token could not be minted',
   };
-  const noToken = { skipped: 'no resource token' };
+  const noJitToken = { skipped: jit.info.error ? `JIT token mint failed: ${jit.info.error}` : 'no JIT resource token' };
   const directHost = SUPABASE_URL_INFO.project_ref ? `db.${SUPABASE_URL_INFO.host}` : null;
-  const [serverAccess, serverDbIdentity, controls, jitApi, jitLogin, jitLoginNoJit, directLogin, endUser] = await Promise.all([
+  const [serverAccess, serverDbIdentity, controls, jitApi, jitApiDefaultRole, jitLogin, jitLoginNoJit, directLogin, endUser] = await Promise.all([
     server.client ? probeAccess(server.client) : skipped,
     server.client ? dbWhoami(server.client) : skipped,
     server.client && resourceToken ? runControls(server.ctx) : skipped,
+    jitToken ? requestJitAccess(jitToken) : noJitToken,
+    // Control: the default-role (service_role) token must not get JIT access to JIT_ROLE.
     resourceToken ? requestJitAccess(resourceToken) : noToken,
-    resourceToken ? loginWithToken(resourceToken, { options: '--jit=true' }) : noToken,
-    resourceToken ? loginWithToken(resourceToken) : noToken,
-    resourceToken && directHost ? loginDirect(resourceToken, directHost) : noToken,
+    jitToken ? loginWithToken(jitToken, { options: '--jit=true' }) : noJitToken,
+    jitToken ? loginWithToken(jitToken) : noJitToken,
+    jitToken && directHost ? loginDirect(jitToken, directHost) : noJitToken,
     describeEndUser(req),
   ]);
 
@@ -399,7 +422,9 @@ async function runDiagnostics(req, res) {
       ...(server.info.auth_path === 'vercel_oidc_marketplace' && { controls }),
     },
     jit: {
+      resource_token: jit.info,
       management_api: jitApi,
+      management_api_default_role: jitApiDefaultRole,
       postgres_login: jitLogin,
       postgres_login_no_jit: jitLoginNoJit,
       direct_login: directLogin,
