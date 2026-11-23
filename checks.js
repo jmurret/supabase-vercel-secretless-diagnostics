@@ -133,8 +133,23 @@ const needDb = (c) =>
 
 const isSkipped = (r) => !r || r.skipped;
 
+// The JIT checks use a separate token minted with role JIT_ROLE. They fail when that mint failed.
+const needJitToken = (c) => {
+  const s = needResource(c);
+  if (s) return s;
+  const t = c.jit?.resource_token;
+  if (t?.error) {
+    return fail(`JIT token with role ${JIT_ROLE}`, { status: t.status ?? null, error: t.error, response_body: t.response_body ?? null },
+      `The token with role ${JIT_ROLE} could not be minted.`);
+  }
+  return null;
+};
+
 const JIT_HINT = 'Check that JIT access is enabled: run `pnpm run enable-jit`.';
 const CTRL_2151_HINT = 'Known issue CTRL-2151: the pooler needs `--jit=true`.';
+const JIT_ROLE_MISMATCH = 'Token role does not match requested role';
+const JIT_ROLE_HINT = `The token role must equal the requested JIT role. Mint the token with ?role=${JIT_ROLE}.`;
+const jitApiHint = (r) => (r.status === 403 && r.error?.includes(JIT_ROLE_MISMATCH) ? JIT_ROLE_HINT : JIT_HINT);
 const NO_ROUTE_CODES = ['ENETUNREACH', 'EHOSTUNREACH', 'EADDRNOTAVAIL', 'ETIMEDOUT'];
 const isAuthFailure = (r) => r.code === '28P01' || /password authentication failed/.test(r.error);
 const isNoRoute = (r) => NO_ROUTE_CODES.includes(r.code) || r.error === 'timeout expired';
@@ -585,26 +600,59 @@ const CHECKS = [
     },
   },
   {
+    id: 'jit_token_role',
+    group: 'jit',
+    description: `The JIT token is minted with ?role=${JIT_ROLE} and carries role ${JIT_ROLE}`,
+    run: (c) => {
+      const s = needJitToken(c);
+      if (s) return s;
+      const t = c.jit?.resource_token;
+      if (!t || t.skipped) return skip(t?.skipped ?? 'No JIT token was minted.');
+      const role = t.claims?.role ?? null;
+      return role === JIT_ROLE
+        ? pass(`role = ${JIT_ROLE}`, { role, expires_in_s: t.claims?.expires_in_s ?? null })
+        : fail(`role = ${JIT_ROLE}`, { role }, 'Vercel did not issue the requested role. Check the allowed roles in the resource customClaims.');
+    },
+  },
+  {
     id: 'jit_management_api',
     group: 'jit',
-    description: `Management API grants JIT database access (${JIT_ROLE}) for the resource token`,
+    description: `Management API grants JIT database access (${JIT_ROLE}) for the JIT token`,
     run: (c) => {
-      const s = needResource(c);
+      const s = needJitToken(c);
       if (s) return s;
       const r = c.jit?.management_api;
       if (!r) return skip('JIT access was not requested.');
       if (r.skipped) return warn('HTTP 200', null, r.skipped);
       if (r.status === 200) return pass(`HTTP 200, role ${JIT_ROLE}`, { status: r.status, role: r.role ?? null, ms: r.ms });
       return fail(`HTTP 200, role ${JIT_ROLE}`, { status: r.status ?? null, error: r.error ?? null },
-        JIT_HINT);
+        jitApiHint(r));
+    },
+  },
+  {
+    id: 'jit_default_role_rejected',
+    group: 'jit',
+    description: `Management API rejects JIT access (${JIT_ROLE}) for the default-role (service_role) resource token`,
+    run: (c) => {
+      const s = needResource(c);
+      if (s) return s;
+      const r = c.jit?.management_api_default_role;
+      const expected = `HTTP 403 "${JIT_ROLE_MISMATCH}"`;
+      if (!r) return skip('JIT access was not requested with the default-role token.');
+      if (r.skipped) return warn(expected, null, r.skipped);
+      const actual = { status: r.status ?? null, error: r.error ?? null, ...(r.role && { role: r.role }) };
+      if (r.status === 403 && r.error?.includes(JIT_ROLE_MISMATCH)) return pass(expected, actual);
+      return fail(expected, actual, r.status === 200
+        ? 'A token minted without ?role got JIT access. The Management API does not bind JIT to the token role claim.'
+        : null);
     },
   },
   {
     id: 'jit_postgres_login',
     group: 'jit',
-    description: `Postgres login through POSTGRES_URL's host with the resource token as the password and the --jit=true option runs as ${JIT_ROLE}`,
+    description: `Postgres login through POSTGRES_URL's host with the JIT token as the password and the --jit=true option runs as ${JIT_ROLE}`,
     run: (c) => {
-      const s = needResource(c);
+      const s = needJitToken(c);
       if (s) return s;
       const r = c.jit?.postgres_login;
       const expected = `current_user = ${JIT_ROLE}`;
@@ -619,9 +667,9 @@ const CHECKS = [
   {
     id: 'jit_postgres_login_no_jit',
     group: 'jit',
-    description: `Postgres login through POSTGRES_URL's host with the resource token as the password and without the --jit=true option (CTRL-2151)`,
+    description: `Postgres login through POSTGRES_URL's host with the JIT token as the password and without the --jit=true option (CTRL-2151)`,
     run: (c) => {
-      const s = needResource(c);
+      const s = needJitToken(c);
       if (s) return s;
       const r = c.jit?.postgres_login_no_jit;
       const expected = `current_user = ${JIT_ROLE}`;
@@ -639,9 +687,9 @@ const CHECKS = [
   {
     id: 'jit_direct_login',
     group: 'jit',
-    description: `Postgres login to the direct host (db.<project host>, IPv4 if it has an address, else IPv6) with the resource token as the password runs as ${JIT_ROLE}`,
+    description: `Postgres login to the direct host (db.<project host>, IPv4 if it has an address, else IPv6) with the JIT token as the password runs as ${JIT_ROLE}`,
     run: (c) => {
-      const s = needResource(c);
+      const s = needJitToken(c);
       if (s) return s;
       const r = c.jit?.direct_login;
       const expected = `current_user = ${JIT_ROLE}`;

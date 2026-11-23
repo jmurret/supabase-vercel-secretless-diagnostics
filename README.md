@@ -34,16 +34,23 @@ and deployable as a Vercel function). Returns JSON (non-secret) shaped as `{ "da
     `POST https://api.vercel.com/v1/integrations/resources/<MARKETPLACE_RESOURCE_ID>/token`,
     and that resource token is sent to Supabase. Both tokens' headers (`alg`, `kid`) and safe
     claims are shown under `oidc` and `resource_token`, plus mint errors (status/body) if the
-    exchange fails. Minted tokens are cached until a minute before they expire. `apikey` describes
+    exchange fails. This request has no `role` query parameter, so Vercel issues the default role
+    of the resource (`service_role`). Minted tokens are cached by resource and role until a minute
+    before they expire. `apikey` describes
     the public key sent in the `apikey` header (`SUPABASE_PUBLISHABLE_KEY` /
     `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` / `SUPABASE_ANON_KEY` / `NEXT_PUBLIC_SUPABASE_ANON_KEY`).
     `controls` holds two control calls to `whoami_vercel()`: `apikey_only` (no bearer token, should
     run as `anon`) and `tampered_token` (resource token with a broken signature, should get `401 PGRST301`).
   - `auth_path: "vercel_integration_keys"` otherwise, showing which env var is used
     (`SUPABASE_SERVICE_ROLE_KEY` / `SUPABASE_ANON_KEY` / `NEXT_PUBLIC_SUPABASE_ANON_KEY`) and its role.
-- `jit` – just-in-time database access with the resource token (OIDC path only):
+- `jit` – just-in-time database access (OIDC path only). The Management API accepts a token only
+  if its role is the same as the requested role. Because of this, the JIT checks use a second
+  resource token, minted with `POST .../token?role=postgres`. `resource_token` shows its header and
+  safe claims, or the mint error. The default-role token is not used for JIT access.
   `management_api` is `POST <management api>/v1/projects/<ref>/database/jit` (role `postgres`).
-  `postgres_login` logs in to the host/port/user from `POSTGRES_URL` with the resource token as the
+  `management_api_default_role` is the same request with the default-role (`service_role`) token.
+  It is a control: the Management API must reject it, because the token role is not `postgres`.
+  `postgres_login` logs in to the host/port/user from `POSTGRES_URL` with the JIT token as the
   password and the startup option `--jit=true` (the static password in `POSTGRES_URL` is ignored).
   `postgres_login_no_jit` is the same login without the option. `direct_login` logs in as `postgres`
   to `db.<project host>`. It uses the IPv4 address when the host has one (Supabase IPv4 add-on),
@@ -94,7 +101,7 @@ or the runtime cannot run the check). `summary.status` is the worst of `fail`, `
 | `mint` | `mint_ok` (with hints for spec error codes such as `resource_oidc_not_enabled`) |
 | `resource_token` | `resource_alg_kid`, `resource_required_claims` (aud, sub, act, iat, nbf, exp), `resource_iss`, `resource_aud`, `resource_sub`, `resource_sub_project` (sub = project ref in `SUPABASE_URL`), `resource_role` (`service_role`), `resource_act` (act.sub = deployment OIDC sub), `resource_environment`, `resource_time` (60 s tolerance), `resource_lifetime` (≤ 15 min), `resource_size` (≤ 4 KB), `resource_signature` (verified against `<iss>/jwks.json`) |
 | `database` | `db_accepted` (PGRST301 → add the issuer as a Custom OIDC third-party provider), `db_role` (runs as `service_role`), `db_claims_match`, `db_rls_bypass` (`service_role` bypasses RLS), `db_table_access`, `db_anon_control` (apikey only → `anon`), `db_tampered_rejected` (tampered token → `401 PGRST301`) |
-| `jit` | `jit_management_api` (Management API grants JIT access), `jit_postgres_login` (pooler login with the token and `--jit=true` runs as `postgres`), `jit_postgres_login_no_jit` (pooler login without `--jit=true`; this check fails until CTRL-2151 is done), `jit_direct_login` (direct login runs as `postgres`; uses the IPv4 address when the host has one, else IPv6; skipped when the host has only an IPv6 address and the runtime has no IPv6 route) |
+| `jit` | `jit_token_role` (the token minted with `?role=postgres` has the role `postgres`), `jit_management_api` (Management API grants JIT access), `jit_default_role_rejected` (Management API rejects JIT access for the default-role token with `403 Token role does not match requested role`), `jit_postgres_login` (pooler login with the JIT token and `--jit=true` runs as `postgres`), `jit_postgres_login_no_jit` (pooler login without `--jit=true`; this check fails until CTRL-2151 is done), `jit_direct_login` (direct login runs as `postgres`; uses the IPv4 address when the host has one, else IPv6; skipped when the host has only an IPv6 address and the runtime has no IPv6 route) |
 
 Optional env vars for exact matches (otherwise the check only validates the format and warns):
 
