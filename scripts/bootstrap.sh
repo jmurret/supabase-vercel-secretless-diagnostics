@@ -2,22 +2,27 @@
 # Set up the linked Vercel project and the Supabase schema. Safe to run many times.
 # Step 1 sets MARKETPLACE_RESOURCE_ID to the Supabase resource connected to the linked
 # project, removes the static secrets, and pulls a new .env.local.
-# Step 2 asks once for a Supabase access token (or reads SUPABASE_ACCESS_TOKEN). Press Enter
-# to skip it.
+# Step 2 mints a postgres-role resource token from VERCEL_OIDC_TOKEN for the Management API.
+# If the Management API rejects it, the script asks once for a Supabase access token (or reads
+# SUPABASE_ACCESS_TOKEN). Press Enter to skip it. See scripts/lib.sh.
 # Step 3 applies supabase/migrations through the Management API, unless the Data API
-# shows that public.whoami_vercel() and public.countries already exist. It needs the token.
-# Step 4 offers to enable the Supabase IPv4 add-on when db.<project host> has no A record.
-# Step 5 enables JIT with scripts/enable-jit.sh.
-# Step 6 redeploys production.
-# A failure in step 4, 5 or 6 only prints a warning.
+# shows that public.whoami_vercel() and public.countries already exist.
+# Step 4 sets SUPABASE_POOLER_HOST, SUPABASE_POOLER_PORT and SUPABASE_POOLER_USER (no password)
+# from the Management API, for the JIT pooler login checks.
+# Step 5 offers to enable the Supabase IPv4 add-on when db.<project host> has no A record.
+# Step 6 enables JIT with scripts/enable-jit.sh.
+# Step 7 redeploys production.
+# A failure in step 4, 5, 6 or 7 only prints a warning.
 # Needs: vercel CLI, node, curl. Run `vercel link` once before.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 environments="production,preview,development"
-secrets=(SUPABASE_JWT_SECRET SUPABASE_SECRET_KEY SUPABASE_SERVICE_ROLE_KEY)
-hl="" reset=""
-if [ -t 2 ]; then hl=$'\033[1;33m'; reset=$'\033[0m'; fi
+secrets=(
+  SUPABASE_JWT_SECRET SUPABASE_SECRET_KEY SUPABASE_SERVICE_ROLE_KEY
+  POSTGRES_URL POSTGRES_PRISMA_URL POSTGRES_URL_NON_POOLING POSTGRES_PASSWORD
+)
+source scripts/lib.sh
 
 for cmd in vercel node curl; do
   command -v "$cmd" >/dev/null || { echo "Install $cmd first." >&2; exit 1; }
@@ -59,6 +64,7 @@ Changes in $environments:
   remove  ${secrets[*]}
           ${hl}Static secrets can authenticate without OIDC, so we remove them to ensure only OIDC is used.${reset}
   replace .env.local with the Development variables
+  set     SUPABASE_POOLER_HOST, SUPABASE_POOLER_PORT, SUPABASE_POOLER_USER (no password)
   enable  JIT access (SSL enforcement + JIT) on the Supabase project
   redeploy production
 EOF
@@ -78,12 +84,6 @@ done
 rm -f .env.local
 vercel env pull .env.local --yes
 
-env_value() {
-  local name
-  for name in "$@"; do
-    grep -E "^$name=" .env.local | tail -n 1 | cut -d= -f2- | sed -E 's/^"(.*)"$/\1/' || true
-  done | head -n 1
-}
 case "$(env_value SUPABASE_URL NEXT_PUBLIC_SUPABASE_URL)" in
   https://*) ;;
   *)
@@ -96,33 +96,16 @@ EOF
     exit 1
     ;;
 esac
-[ -n "$(env_value POSTGRES_URL)" ] || echo "Warning: POSTGRES_URL is not set. The JIT login checks need it from the Supabase integration." >&2
+[ -n "$(env_value VERCEL_OIDC_TOKEN)" ] || echo "Warning: VERCEL_OIDC_TOKEN is not in .env.local. Enable OIDC Federation (Secure backend access) in the Vercel project settings." >&2
 
 echo >&2
-echo "==> Step 2: Supabase access token" >&2
-url="$(env_value SUPABASE_URL NEXT_PUBLIC_SUPABASE_URL)"
-url="${url%/}"
+echo "==> Step 2: Management API credential" >&2
+load_supabase_project
 key="$(env_value SUPABASE_PUBLISHABLE_KEY NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY SUPABASE_ANON_KEY NEXT_PUBLIC_SUPABASE_ANON_KEY)"
-host="${url#*://}"
-ref="${host%%.*}"
-[ -n "$ref" ] || { echo "SUPABASE_URL is not in .env.local." >&2; exit 1; }
-
-case "$host" in
-  *.supabase.red) mgmt=https://api.supabase.green dashboard=https://supabase.green/dashboard ;;
-  *) mgmt=https://api.supabase.com dashboard=https://supabase.com/dashboard ;;
-esac
-
-if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ] && [ -t 0 ]; then
-  cat >&2 <<EOF
-A Supabase access token lets bootstrap apply the schema if missing, enable the IPv4 add-on if missing, and enable JIT.
-  ${hl}Use an experimental API token. It is used for this run only and is not saved.${reset}
-  Create one at $dashboard/account/tokens, or set SUPABASE_ACCESS_TOKEN to skip this prompt.
-EOF
-  read -rs -p "Supabase access token (input hidden, press Enter to skip): " SUPABASE_ACCESS_TOKEN || SUPABASE_ACCESS_TOKEN=""
-  echo >&2
-fi
-export SUPABASE_ACCESS_TOKEN="${SUPABASE_ACCESS_TOKEN:-}"
-[ -n "$SUPABASE_ACCESS_TOKEN" ] || echo "No access token. The schema, IPv4 add-on and JIT steps cannot make changes." >&2
+mint_resource_token
+export SUPABASE_RESOURCE_TOKEN
+[ -z "${SUPABASE_ACCESS_TOKEN:-}" ] || echo "SUPABASE_ACCESS_TOKEN is set. It is used only if the Management API rejects the resource token." >&2
+has_mgmt_credential || echo "No Management API credential. The schema, pooler, IPv4 add-on and JIT steps cannot make changes." >&2
 
 echo >&2
 echo "==> Step 3: Supabase schema" >&2
@@ -132,27 +115,54 @@ if [ -n "$key" ] &&
   [ "$(status -X POST -H 'Content-Type: application/json' -d '{}' "$url/rest/v1/rpc/whoami_vercel")" = 200 ]; then
   echo "public.whoami_vercel() and public.countries already exist. Skipped." >&2
 else
-  [ -n "$SUPABASE_ACCESS_TOKEN" ] || {
-    echo "Applying supabase/migrations to project $ref needs a Supabase access token. Set SUPABASE_ACCESS_TOKEN and run this script again." >&2
-    exit 1
-  }
   for file in supabase/migrations/*.sql; do
     base="${file##*/}"
     name="${base%.sql}"
     name="${name#*_}"
-    out="$(node -e 'process.stdout.write(JSON.stringify({ query: require("fs").readFileSync(process.argv[1], "utf8"), name: process.argv[2] }))' "$file" "$name" |
-      curl -sS --fail-with-body -X POST \
-        -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
-        -H 'Content-Type: application/json' \
-        --data-binary @- \
-        "$mgmt/v1/projects/$ref/database/migrations")" || { echo "Migration $base failed: $out" >&2; exit 1; }
-    echo "Applied $base" >&2
+    mgmt_api POST database/migrations "$(node -e 'process.stdout.write(JSON.stringify({ query: require("fs").readFileSync(process.argv[1], "utf8"), name: process.argv[2] }))' "$file" "$name")"
+    if ! mgmt_ok; then
+      echo "Migration $base failed: HTTP $MGMT_STATUS $MGMT_BODY" >&2
+      [[ ! "$MGMT_STATUS" =~ ^(000|401|403)$ ]] || echo "Set SUPABASE_ACCESS_TOKEN (an experimental API token) and run this script again." >&2
+      exit 1
+    fi
+    echo "Applied $base ($MGMT_AUTH)" >&2
   done
-  echo "Schema created. Later runs find it and do not ask for a token." >&2
+  echo "Schema created. Later runs find it and skip this step." >&2
 fi
 
 echo >&2
-echo "==> Step 4: IPv4 address for the direct database host" >&2
+echo "==> Step 4: Pooler connection settings" >&2
+# The JIT pooler login reads these instead of POSTGRES_URL, which holds a static password.
+pooler_warning() {
+  echo "WARNING: Pooler settings not set; the JIT pooler login checks are skipped. $1" >&2
+}
+mgmt_api GET config/database/pooler
+if ! mgmt_ok; then
+  pooler_warning "GET config/database/pooler: HTTP $MGMT_STATUS $MGMT_BODY"
+elif ! pooler="$(printf '%s' "$MGMT_BODY" | node -e '
+  const all = JSON.parse(require("fs").readFileSync(0, "utf8"));
+  const p = (Array.isArray(all) ? all : [all]).find((x) => x.database_type === "PRIMARY") || all[0];
+  if (!p?.db_host || !p?.db_port || !p?.db_user) process.exit(1);
+  console.log([p.db_host, p.db_port, p.db_user].join("\t"));
+')"; then
+  pooler_warning "The response has no db_host, db_port and db_user."
+else
+  IFS=$'\t' read -r pooler_host pooler_port pooler_user <<<"$pooler"
+  if [ "$(env_value SUPABASE_POOLER_HOST)" = "$pooler_host" ] &&
+    [ "$(env_value SUPABASE_POOLER_PORT)" = "$pooler_port" ] &&
+    [ "$(env_value SUPABASE_POOLER_USER)" = "$pooler_user" ]; then
+    echo "Pooler settings are up to date ($pooler_user@$pooler_host:$pooler_port). Skipped." >&2
+  else
+    vercel env add SUPABASE_POOLER_HOST --environment "$environments" --value "$pooler_host" --type config --force --yes
+    vercel env add SUPABASE_POOLER_PORT --environment "$environments" --value "$pooler_port" --type config --force --yes
+    vercel env add SUPABASE_POOLER_USER --environment "$environments" --value "$pooler_user" --type config --force --yes
+    vercel env pull .env.local --yes
+    echo "Set the pooler settings ($pooler_user@$pooler_host:$pooler_port)." >&2
+  fi
+fi
+
+echo >&2
+echo "==> Step 5: IPv4 address for the direct database host" >&2
 ipv4_warning() {
   echo "WARNING: IPv4 add-on not enabled. $1" >&2
   cat >&2 <<EOF
@@ -172,46 +182,32 @@ else
     if [[ ! "$answer" =~ ^[Yy]$ ]]; then
       ipv4_warning "Declined."
     else
-      if [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
-        ipv4_warning "No access token."
+      mgmt_api PATCH billing/addons '{"addon_type":"ipv4","addon_variant":"ipv4_default"}'
+      if mgmt_ok; then
+        echo "IPv4 add-on requested. The A record can take some minutes to appear." >&2
+      elif [ "$MGMT_STATUS" = 401 ] || [ "$MGMT_STATUS" = 403 ]; then
+        ipv4_warning "HTTP $MGMT_STATUS: $MGMT_BODY. Use an experimental API token."
       else
-        rc=0
-        out="$(curl -sS --max-time 30 -X PATCH \
-          -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
-          -H 'Content-Type: application/json' \
-          -d '{"addon_type":"ipv4","addon_variant":"ipv4_default"}' \
-          -w $'\n%{http_code}' \
-          "$mgmt/v1/projects/$ref/billing/addons" 2>&1)" || rc=$?
-        code="${out##*$'\n'}"
-        body="${out%$'\n'*}"
-        if [ "$rc" -ne 0 ]; then
-          ipv4_warning "curl failed (exit $rc): $out"
-        elif [[ "$code" =~ ^2[0-9][0-9]$ ]]; then
-          echo "IPv4 add-on requested. The A record can take some minutes to appear." >&2
-        elif [ "$code" = 401 ] || [ "$code" = 403 ]; then
-          ipv4_warning "HTTP $code: $body. Use an experimental API token."
-        else
-          ipv4_warning "HTTP $code: $body"
-        fi
+        ipv4_warning "HTTP $MGMT_STATUS: $MGMT_BODY"
       fi
     fi
   fi
 fi
 
 echo >&2
-echo "==> Step 5: JIT access" >&2
+echo "==> Step 6: JIT access" >&2
 jit_warning() {
   echo "WARNING: JIT is not enabled; the JIT checks will fail. $1" >&2
   echo "Run \`pnpm run enable-jit\` later (needed until CTRL-2145/CTRL-2146)." >&2
 }
-if [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
-  jit_warning "No access token."
+if [ -z "$SUPABASE_RESOURCE_TOKEN" ] && [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
+  jit_warning "No Management API credential."
 elif ! bash scripts/enable-jit.sh </dev/null; then
   jit_warning "scripts/enable-jit.sh failed."
 fi
 
 echo >&2
-echo "==> Step 6: Redeploy production" >&2
+echo "==> Step 7: Redeploy production" >&2
 # A deployment only sees the variables that existed when it was built.
 redeploy_warning() {
   echo "WARNING: Production was not redeployed. $1" >&2

@@ -7,11 +7,13 @@ Use a Vercel project that has the Supabase Marketplace integration. Then do thes
 1. Link the project: `vercel link`.
 2. Run `pnpm run bootstrap`. The script is safe to run again. It does this:
    - Sets `MARKETPLACE_RESOURCE_ID` to the Supabase resource that is connected to the linked project.
-   - Removes `SUPABASE_JWT_SECRET`, `SUPABASE_SECRET_KEY` and `SUPABASE_SERVICE_ROLE_KEY` from the project. Code that uses these static secrets stops working.
-   - Replaces `.env.local` with the Development variables. It warns if `POSTGRES_URL` is not set.
-   - Applies the files in `supabase/migrations` (`public.whoami_vercel()` and `public.countries`). It asks once for a Supabase access token. Use an experimental API token. The token is hidden and is not saved. Press Enter to skip it, or set `SUPABASE_ACCESS_TOKEN` to skip the prompt. The schema step needs the token when the schema is missing.
+   - Removes `SUPABASE_JWT_SECRET`, `SUPABASE_SECRET_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `POSTGRES_URL`, `POSTGRES_PRISMA_URL`, `POSTGRES_URL_NON_POOLING` and `POSTGRES_PASSWORD` from the project. Code that uses these static secrets stops working.
+   - Replaces `.env.local` with the Development variables. It warns if `VERCEL_OIDC_TOKEN` is not set.
+   - Calls the Supabase Management API with a resource token (role `postgres`) minted from `VERCEL_OIDC_TOKEN`, so no static secret is needed. If the Management API rejects that token (HTTP 401/403), the script asks once for a Supabase access token. Use an experimental API token. The token is hidden and is not saved. Press Enter to skip it, or set `SUPABASE_ACCESS_TOKEN` to skip the prompt. See [`scripts/lib.sh`](./scripts/lib.sh).
+   - Applies the files in `supabase/migrations` (`public.whoami_vercel()` and `public.countries`) when the schema is missing.
+   - Sets `SUPABASE_POOLER_HOST`, `SUPABASE_POOLER_PORT` and `SUPABASE_POOLER_USER` (no password) from the Management API pooler settings. The JIT pooler login checks use them instead of `POSTGRES_URL`.
    - Offers to enable the Supabase IPv4 add-on when `db.<project host>` has no IPv4 address. The add-on is paid. Without it, the direct login check is skipped on Vercel. If the request fails, the script only prints a warning and the manual command.
-   - Enables JIT access and SSL enforcement with the same token, until CTRL-2145 and CTRL-2146 are done. If this fails or you skipped the token, the script only prints a warning. Then run `pnpm run enable-jit`. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
+   - Enables JIT access and SSL enforcement with the same credential, until CTRL-2145 and CTRL-2146 are done. If this fails or you skipped the token, the script only prints a warning. Then run `pnpm run enable-jit`. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
    - Redeploys the latest Ready production deployment, because a deployment only sees the variables that existed when it was built. If this fails, the script only prints a warning and the manual command.
 
 ## `GET /`
@@ -41,8 +43,8 @@ and deployable as a Vercel function). Returns JSON (non-secret) shaped as `{ "da
     `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` / `SUPABASE_ANON_KEY` / `NEXT_PUBLIC_SUPABASE_ANON_KEY`).
     `controls` holds two control calls to `whoami_vercel()`: `apikey_only` (no bearer token, should
     run as `anon`) and `tampered_token` (resource token with a broken signature, should get `401 PGRST301`).
-  - `auth_path: "vercel_integration_keys"` otherwise, showing which env var is used
-    (`SUPABASE_SERVICE_ROLE_KEY` / `SUPABASE_ANON_KEY` / `NEXT_PUBLIC_SUPABASE_ANON_KEY`) and its role.
+  - `auth_path: "vercel_integration_keys"` otherwise, showing which public key env var is used
+    (same list as `apikey`) and its role. Secret and service-role keys are never used.
 - `jit` – just-in-time database access (OIDC path only). The Management API accepts a token only
   if its role is the same as the requested role. Because of this, the JIT checks use a second
   resource token, minted with `POST .../token?role=postgres`. `resource_token` shows its header and
@@ -50,8 +52,8 @@ and deployable as a Vercel function). Returns JSON (non-secret) shaped as `{ "da
   `management_api` is `POST <management api>/v1/projects/<ref>/database/jit` (role `postgres`).
   `management_api_default_role` is the same request with the default-role (`service_role`) token.
   It is a control: the Management API must reject it, because the token role is not `postgres`.
-  `postgres_login` logs in to the host/port/user from `POSTGRES_URL` with the JIT token as the
-  password and the startup option `--jit=true` (the static password in `POSTGRES_URL` is ignored).
+  `postgres_login` logs in to `SUPABASE_POOLER_HOST`/`SUPABASE_POOLER_PORT`/`SUPABASE_POOLER_USER`
+  (set by `pnpm run bootstrap`) with the JIT token as the password and the startup option `--jit=true`.
   `postgres_login_no_jit` is the same login without the option. `direct_login` logs in as `postgres`
   to `db.<project host>`. It uses the IPv4 address when the host has one (Supabase IPv4 add-on),
   and the IPv6 address otherwise. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
@@ -96,7 +98,7 @@ or the runtime cannot run the check). `summary.status` is the worst of `fail`, `
 | Group | Checks |
 |---|---|
 | `config` | `supabase_url`, `apikey_public` (no secret/service-role key in the `apikey` header), `resource_id` (`store_…` / `ir_…`) |
-| `path` | `auth_path` (OIDC path in use), `no_static_secret` (warn if a service-role/secret key or `SUPABASE_JWT_SECRET` is set, under any env var name) |
+| `path` | `auth_path` (OIDC path in use), `no_static_secret` (warn if a service-role/secret key, `SUPABASE_JWT_SECRET` or a `POSTGRES_URL*`/`POSTGRES_PASSWORD` is set; secret keys are detected under any env var name) |
 | `vercel_oidc` | `oidc_present`, `oidc_iss`, `oidc_alg_kid` (RS256 + kid), `oidc_not_expired`, `oidc_owner_project`, `oidc_team` (`VERCEL_TEAM_ID`, if set, = `owner_id`) |
 | `mint` | `mint_ok` (with hints for spec error codes such as `resource_oidc_not_enabled`) |
 | `resource_token` | `resource_alg_kid`, `resource_required_claims` (aud, sub, act, iat, nbf, exp), `resource_iss`, `resource_aud`, `resource_sub`, `resource_sub_project` (sub = project ref in `SUPABASE_URL`), `resource_role` (`service_role`), `resource_act` (act.sub = deployment OIDC sub), `resource_environment`, `resource_time` (60 s tolerance), `resource_lifetime` (≤ 15 min), `resource_size` (≤ 4 KB), `resource_signature` (verified against `<iss>/jwks.json`) |
@@ -113,16 +115,16 @@ Optional env vars for exact matches (otherwise the check only validates the form
 
 The JIT checks need JIT access and SSL enforcement on the Supabase project. The platform will enable both automatically for Vercel Marketplace resources, but it does not do this yet:
 
-- [CTRL-2146](https://linear.app/supabase/issue/CTRL-2146/configure-jit-when-creating-vercel-marketplace-resources): configure JIT when Vercel Marketplace resources are created.
-- [CTRL-2145](https://linear.app/supabase/issue/CTRL-2145/support-backfill-on-existing-projects): backfill existing projects.
-- [CTRL-2151](https://linear.app/supabase/issue/CTRL-2151/make-pooler-jit-login-work-without-the-jittrue-client-option): pooler JIT login without the `--jit=true` client option.
+- CTRL-2146: configure JIT when Vercel Marketplace resources are created.
+- CTRL-2145: backfill existing projects.
+- CTRL-2151: pooler JIT login without the `--jit=true` client option.
 
 `pnpm run bootstrap` enables both when it has an access token. To run only this step, for example after you skipped the token:
 
 1. Do the steps in [Set up](#set-up) to link the project and pull `.env.local` (`pnpm run bootstrap`).
 2. Run `pnpm run enable-jit`.
 
-The script needs an experimental API token. It enables SSL enforcement, then JIT access, and waits until the change is applied. It is safe to run again.
+The script uses the same credential as bootstrap: a resource token minted from `VERCEL_OIDC_TOKEN`, then an experimental API token if the Management API rejects it. It enables SSL enforcement, then JIT access, and waits until the change is applied. It is safe to run again.
 
 The pooler can need some minutes more before it accepts JIT logins.
 

@@ -6,7 +6,7 @@ const { runChecks } = require('../checks');
 
 const URL_ENV_VAR = ['SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_URL'].find((n) => process.env[n]);
 const SUPABASE_URL = URL_ENV_VAR ? process.env[URL_ENV_VAR].replace(/\/+$/, '') : undefined;
-const KEY_ENV_VARS = ['SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY'];
+// Public keys only: secret/service-role keys are removed for OIDC (secretless) resources.
 const ANON_KEY_ENV_VARS = [
   'SUPABASE_PUBLISHABLE_KEY', 'NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY', 'SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY',
 ];
@@ -162,11 +162,11 @@ async function mintAndDescribe(resourceId, oidcToken, role) {
 }
 
 // Uses a Marketplace resource token (minted from the Vercel OIDC token) when an OIDC token is
-// available, otherwise the Supabase keys injected by the Vercel integration.
+// available, otherwise the public Supabase key injected by the Vercel integration.
 async function resolveServerCredential(req) {
   const oidc = await getOidcToken(req);
   if (oidc) {
-    const anonKey = firstEnv(ANON_KEY_ENV_VARS) || firstEnv(KEY_ENV_VARS);
+    const anonKey = firstEnv(ANON_KEY_ENV_VARS);
     const resourceId = process.env.MARKETPLACE_RESOURCE_ID;
     const info = {
       auth_path: 'vercel_oidc_marketplace',
@@ -192,7 +192,7 @@ async function resolveServerCredential(req) {
       ctx: { oidcToken: oidc.token, resourceToken: token, apikey: anonKey?.value },
     };
   }
-  const key = firstEnv(KEY_ENV_VARS);
+  const key = firstEnv(ANON_KEY_ENV_VARS);
   return {
     client: makeClient(key?.value),
     info: {
@@ -243,7 +243,7 @@ async function describeEndUser(req) {
   const jwt = match[1].trim();
   const result = { present: true, jwt_header: jwtHeader(jwt), claims: safeClaims(decodeJwt(jwt)) };
 
-  const key = firstEnv(ANON_KEY_ENV_VARS) || firstEnv(KEY_ENV_VARS);
+  const key = firstEnv(ANON_KEY_ENV_VARS);
   const authClient = makeClient(key?.value);
   if (!authClient) return { ...result, authenticated: false, error: 'Supabase URL or key is not configured' };
   try {
@@ -318,20 +318,17 @@ async function requestJitAccess(token) {
   }
 }
 
-// Logs in to Postgres with the resource token as the password; the password in POSTGRES_URL is ignored.
-// Without an explicit host, host, port and user come from POSTGRES_URL.
+// Logs in to Postgres with the resource token as the password. Without an explicit host, host, port
+// and user come from SUPABASE_POOLER_HOST/PORT/USER (set by `pnpm run bootstrap`); no static password is used.
 async function loginWithToken(token, { host, port, user, options, servername, endpoint, timeoutMs = 10_000 } = {}) {
   if (!host) {
-    if (!process.env.POSTGRES_URL) return { skipped: 'POSTGRES_URL is not set' };
-    let url;
-    try {
-      url = new URL(process.env.POSTGRES_URL);
-    } catch {
-      return { skipped: 'POSTGRES_URL is not a valid URL' };
+    const { SUPABASE_POOLER_HOST, SUPABASE_POOLER_PORT, SUPABASE_POOLER_USER } = process.env;
+    if (!SUPABASE_POOLER_HOST || !SUPABASE_POOLER_USER) {
+      return { skipped: 'SUPABASE_POOLER_HOST or SUPABASE_POOLER_USER is not set: run `pnpm run bootstrap`' };
     }
-    host = url.hostname;
-    port = Number(url.port) || 5432;
-    user = decodeURIComponent(url.username);
+    host = SUPABASE_POOLER_HOST;
+    port = Number(SUPABASE_POOLER_PORT) || 5432;
+    user = SUPABASE_POOLER_USER;
   }
   endpoint ??= `${host}:${port}`;
   const client = new Client({

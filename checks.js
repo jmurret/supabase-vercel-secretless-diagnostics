@@ -12,7 +12,10 @@ const REQUIRED_RESOURCE_CLAIMS = ['aud', 'sub', 'act', 'iat', 'nbf', 'exp'];
 const OIDC_ISS_RE = /^https:\/\/oidc\.vercel\.com(\/[^/]+)?$/;
 const RESOURCE_ISS_RE = /^https:\/\/integrations\.vercel\.com\/(oac_[A-Za-z0-9]+)$/;
 const JWKS_MAX_AGE_MS = 60 * 60 * 1000;
-const SECRET_ENV_VARS = ['SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SECRET_KEY', 'SUPABASE_JWT_SECRET'];
+const SECRET_ENV_VARS = [
+  'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SECRET_KEY', 'SUPABASE_JWT_SECRET',
+  'POSTGRES_URL', 'POSTGRES_PRISMA_URL', 'POSTGRES_URL_NON_POOLING', 'POSTGRES_PASSWORD',
+];
 const STATIC_SECRET_ENV_VARS = [
   ...SECRET_ENV_VARS, 'SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY',
   'SUPABASE_PUBLISHABLE_KEY', 'NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY',
@@ -207,7 +210,7 @@ const CHECKS = [
   {
     id: 'no_static_secret',
     group: 'path',
-    description: 'No long-lived Supabase secret keys are present (oidc-only resources have no static secrets)',
+    description: 'No long-lived Supabase secret keys or database passwords are present (oidc-only resources have no static secrets)',
     run: (c) => {
       const present = STATIC_SECRET_ENV_VARS.filter((n) => c.env[n]);
       // Names only; also catches secret keys stored under other env var names.
@@ -215,7 +218,7 @@ const CHECKS = [
         ...SECRET_ENV_VARS.filter((n) => c.env[n]),
         ...Object.keys(c.env).filter((n) => isSecretValue(c.env[n])),
       ])].sort();
-      if (secret.length) return warn('no secret key env vars', secret, 'A service-role/secret key or JWT secret is still configured.');
+      if (secret.length) return warn('no secret key env vars', secret, 'A service-role/secret key, JWT secret or database password is still configured. Run `pnpm run bootstrap` to remove it.');
       return pass('no secret key env vars', present.length ? `only public keys: ${present.join(', ')}` : 'none');
     },
   },
@@ -650,7 +653,7 @@ const CHECKS = [
   {
     id: 'jit_postgres_login',
     group: 'jit',
-    description: `Postgres login through POSTGRES_URL's host with the JIT token as the password and the --jit=true option runs as ${JIT_ROLE}`,
+    description: `Postgres login through the pooler (SUPABASE_POOLER_HOST) with the JIT token as the password and the --jit=true option runs as ${JIT_ROLE}`,
     run: (c) => {
       const s = needJitToken(c);
       if (s) return s;
@@ -667,7 +670,7 @@ const CHECKS = [
   {
     id: 'jit_postgres_login_no_jit',
     group: 'jit',
-    description: `Postgres login through POSTGRES_URL's host with the JIT token as the password and without the --jit=true option (CTRL-2151)`,
+    description: `Postgres login through the pooler (SUPABASE_POOLER_HOST) with the JIT token as the password and without the --jit=true option (CTRL-2151)`,
     run: (c) => {
       const s = needJitToken(c);
       if (s) return s;
