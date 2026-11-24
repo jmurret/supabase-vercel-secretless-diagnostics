@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Set up the linked Vercel project and the Supabase schema. Safe to run many times.
 # Step 1 sets MARKETPLACE_RESOURCE_ID to the Supabase resource connected to the linked
-# project, removes the static secrets, and pulls a new .env.local.
+# project, warns about static secrets (it does not remove them), and pulls a new .env.local.
 # Step 2 asks once for a Supabase access token (or reads SUPABASE_ACCESS_TOKEN). Press Enter
 # to skip it.
 # Step 3 applies supabase/migrations through the Management API, unless the Data API
@@ -59,8 +59,6 @@ Target:
   Resource        $id $label
 Changes in $environments:
   set     MARKETPLACE_RESOURCE_ID=$id
-  remove  ${secrets[*]}
-          ${hl}Static secrets can authenticate without OIDC, so we remove them to ensure only OIDC is used.${reset}
   replace .env.local with the Development variables
   enable  JIT access (SSL enforcement + JIT) on the Supabase project
   redeploy production
@@ -71,13 +69,14 @@ if [ -t 0 ]; then
 fi
 
 vercel env add MARKETPLACE_RESOURCE_ID --environment "$environments" --value "$id" --type config --force --yes
-for name in "${secrets[@]}"; do
-  if vercel env rm "$name" --confirm-name "$name" >/dev/null 2>&1; then
-    echo "Removed $name" >&2
-  else
-    echo "Did not remove $name (not set, or removal failed)" >&2
-  fi
-done
+present="$(vercel env ls 2>/dev/null | awk '{print $1}' | grep -Fx -f <(printf '%s\n' "${secrets[@]}") | sort -u | tr '\n' ' ' || true)"
+if [ -n "$present" ]; then
+  cat >&2 <<EOF
+${hl}Warning: static secrets are set on $project: $present${reset}
+  An OIDC-only Supabase resource must not sync them, and they can authenticate without OIDC.
+  Bootstrap does not remove them. The no_static_secret check fails while they are set.
+EOF
+fi
 rm -f .env.local
 vercel env pull .env.local --yes
 
