@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const { RESYNC_HINT } = require('./pooler');
+const { SERVICES: CROSS_TENANT_SERVICES, evaluateService, gatewayCoverage } = require('./cross-tenant');
 
 // Expectations from "Vercel Marketplace OIDC" (Vercel OIDC secretless spec, Nov 18).
 const SPEC = 'Vercel Marketplace OIDC (spec updated Nov 18)';
@@ -127,6 +128,7 @@ function buildContext(data, ctx, env, nowMs) {
     url: data.environment?.supabase_url ?? null,
     controls: sc.controls ?? null,
     jit: data.jit ?? null,
+    crossTenant: data.cross_tenant ?? null,
   };
 }
 
@@ -155,6 +157,39 @@ const CTRL_2151_HINT = 'Known issue CTRL-2151: the pooler needs `--jit=true`.';
 const JIT_ROLE_MISMATCH = 'Token role does not match requested role';
 const JIT_ROLE_HINT = `The token role must equal the requested JIT role. Mint the token with ?role=${JIT_ROLE}.`;
 const jitApiHint = (r) => (r.status === 403 && r.error?.includes(JIT_ROLE_MISMATCH) ? JIT_ROLE_HINT : JIT_HINT);
+const needCrossTenant = (c) => {
+  const ct = c.crossTenant;
+  if (!ct) return skip('Cross-tenant probes were not run.');
+  if (ct.skipped) return skip(ct.skipped);
+  return null;
+};
+const needCrossTenantTargets = (c) =>
+  needCrossTenant(c) || (c.crossTenant.targets.length ? null : skip('No valid cross-tenant targets; see cross_tenant_targets.'));
+
+function crossTenantServiceCheck(service) {
+  return {
+    id: `cross_tenant_${service.id}`,
+    group: 'cross_tenant',
+    description: `${service.label} on other tenants rejects this tenant's default-role resource token (${service.method} ${service.path})`,
+    run: (c) => {
+      const s = needCrossTenantTargets(c);
+      if (s) return s;
+      const { rows, accepted, inconclusive } = evaluateService(c.crossTenant, service);
+      const expected = `${service.expected} from every target`;
+      const ownRef = c.crossTenant.own.ref;
+      if (accepted.length) {
+        return fail(expected, rows, accepted
+          .map((r) => `regression: ${service.label} on ${r.target} (gateway ${r.gateway_version}) accepted tenant ${ownRef}'s token`)
+          .join('; '));
+      }
+      if (inconclusive.length) {
+        return warn(expected, rows, `Inconclusive: ${inconclusive.map((r) => `${r.target}: ${r.reason}`).join('; ')}`);
+      }
+      return pass(expected, rows);
+    },
+  };
+}
+
 const NO_ROUTE_CODES = ['ENETUNREACH', 'EHOSTUNREACH', 'EADDRNOTAVAIL', 'ETIMEDOUT'];
 const isAuthFailure = (r) => r.code === '28P01' || /password authentication failed/.test(r.error);
 const isNoRoute = (r) => NO_ROUTE_CODES.includes(r.code) || r.error === 'timeout expired';
@@ -742,6 +777,36 @@ const CHECKS = [
       return r.current_user === JIT_ROLE
         ? pass(expected, { endpoint: r.endpoint, address: r.address, current_user: r.current_user, ms: r.ms })
         : fail(expected, { endpoint: r.endpoint, current_user: r.current_user });
+    },
+  },
+  {
+    id: 'cross_tenant_targets',
+    group: 'cross_tenant',
+    description: 'CROSS_TENANT_TARGETS lists other tenants as <project ref or https:// URL>=<publishable or anon key>',
+    run: (c) => {
+      const s = needCrossTenant(c);
+      if (s) return s;
+      const { targets, errors } = c.crossTenant;
+      const actual = { targets: targets.map((t) => t.url), ...(errors.length && { errors }) };
+      if (errors.length) return fail('valid entries for other tenants', actual, errors.map((e) => `${e.target ?? '(empty)'}: ${e.error}`).join(' '));
+      return pass('valid entries for other tenants', actual);
+    },
+  },
+  ...CROSS_TENANT_SERVICES.map(crossTenantServiceCheck),
+  {
+    id: 'cross_tenant_gateway_coverage',
+    group: 'cross_tenant',
+    description: 'Cross-tenant targets cover api-gateway v1 and v2 (from the sb-gateway-version response header)',
+    run: (c) => {
+      const s = needCrossTenantTargets(c);
+      if (s) return s;
+      const { perTarget, seen } = gatewayCoverage(c.crossTenant);
+      const expected = ['v1', 'v2'];
+      const missing = expected.filter((v) => !seen.includes(v));
+      const actual = { seen, targets: perTarget };
+      return missing.length
+        ? warn(expected, actual, `No target answered with gateway ${missing.join(' or ')}. Add a target on that gateway.`)
+        : pass(expected, actual);
     },
   },
 ];

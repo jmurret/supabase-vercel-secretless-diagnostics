@@ -4,6 +4,7 @@ const dns = require('node:dns');
 const { Client } = require('pg');
 const { runChecks } = require('../checks');
 const { poolerLoginParams } = require('../pooler');
+const { runCrossTenant } = require('../cross-tenant');
 
 const URL_ENV_VAR = ['SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_URL'].find((n) => process.env[n]);
 const SUPABASE_URL = URL_ENV_VAR ? process.env[URL_ENV_VAR].replace(/\/+$/, '') : undefined;
@@ -387,7 +388,7 @@ async function runDiagnostics(req, res) {
   };
   const noJitToken = { skipped: jit.info.error ? `JIT token mint failed: ${jit.info.error}` : 'no JIT resource token' };
   const directHost = SUPABASE_URL_INFO.project_ref ? `db.${SUPABASE_URL_INFO.host}` : null;
-  const [serverAccess, serverDbIdentity, controls, jitApi, jitApiDefaultRole, jitLogin, jitLoginNoJit, directLogin, endUser] = await Promise.all([
+  const [serverAccess, serverDbIdentity, controls, jitApi, jitApiDefaultRole, jitLogin, jitLoginNoJit, directLogin, endUser, crossTenant] = await Promise.all([
     server.client ? probeAccess(server.client) : skipped,
     server.client ? dbWhoami(server.client) : skipped,
     server.client && resourceToken ? runControls(server.ctx) : skipped,
@@ -398,6 +399,12 @@ async function runDiagnostics(req, res) {
     jitToken ? loginPooler(jitToken) : noJitToken,
     jitToken && directHost ? loginDirect(jitToken, directHost) : noJitToken,
     describeEndUser(req),
+    runCrossTenant({
+      spec: process.env.CROSS_TENANT_TARGETS,
+      ownUrl: SUPABASE_URL,
+      ownKey: server.ctx?.apikey,
+      token: resourceToken,
+    }),
   ]);
 
   const data = {
@@ -423,6 +430,7 @@ async function runDiagnostics(req, res) {
       direct_login: directLogin,
     },
     end_user: endUser,
+    cross_tenant: crossTenant,
   };
   const checks = await runChecks(data, server.ctx);
   res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
