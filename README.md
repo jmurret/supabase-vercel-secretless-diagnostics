@@ -7,8 +7,8 @@ Use a Vercel project that has the Supabase Marketplace integration. Then do thes
 1. Link the project: `vercel link`.
 2. Run `pnpm run bootstrap`. The script is safe to run again. It does this:
    - Sets `MARKETPLACE_RESOURCE_ID` to the Supabase resource that is connected to the linked project.
-   - Removes `SUPABASE_JWT_SECRET`, `SUPABASE_SECRET_KEY` and `SUPABASE_SERVICE_ROLE_KEY` from the project. Code that uses these static secrets stops working.
-   - Replaces `.env.local` with the Development variables. It warns if `POSTGRES_URL` is not set.
+   - Warns if `SUPABASE_JWT_SECRET`, `SUPABASE_SECRET_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `POSTGRES_URL`, `POSTGRES_PRISMA_URL`, `POSTGRES_URL_NON_POOLING` or `POSTGRES_PASSWORD` is set on the project. An OIDC-only resource must not sync these static secrets. The script does not remove them, so the `no_static_secret` check can show a resource that syncs them.
+   - Replaces `.env.local` with the Development variables. It warns if `POSTGRES_POOLER_HOST` or `SUPABASE_PROJECT_REF` is not set.
    - Applies the files in `supabase/migrations` (`public.whoami_vercel()` and `public.countries`). It asks once for a Supabase access token. Use an experimental API token. The token is hidden and is not saved. Press Enter to skip it, or set `SUPABASE_ACCESS_TOKEN` to skip the prompt. The schema step needs the token when the schema is missing.
    - Offers to enable the Supabase IPv4 add-on when `db.<project host>` has no IPv4 address. The add-on is paid. Without it, the direct login check is skipped on Vercel. If the request fails, the script only prints a warning and the manual command.
    - Enables JIT access and SSL enforcement with the same token, until CTRL-2145 and CTRL-2146 are done. If this fails or you skipped the token, the script only prints a warning. Then run `pnpm run enable-jit`. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
