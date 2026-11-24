@@ -4,6 +4,7 @@
 
 const PROBE_TIMEOUT_MS = 5000;
 const GATEWAY_HEADER = 'sb-gateway-version';
+const HEALTH_PATH = '/auth/v1/health';
 const MAX_ERROR_CHARS = 200;
 const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
 const TARGETS_HINT = 'Set it to comma-separated <project ref or https:// URL>=<publishable or anon key> entries for other tenants.';
@@ -117,6 +118,22 @@ async function probeAll(fetchImpl, baseUrl, key, token) {
   return Object.fromEntries(SERVICES.map((s, i) => [s.id, results[i]]));
 }
 
+// A rejection from a project that does not exist, or that is in another environment, proves nothing.
+async function probeHealth(fetchImpl, baseUrl, key) {
+  try {
+    const res = await fetchImpl(`${baseUrl}${HEALTH_PATH}`, {
+      method: 'GET',
+      headers: { apikey: key },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    await res.body?.cancel?.();
+    return { status: res.status };
+  } catch (err) {
+    return { status: null, error: err.message };
+  }
+}
+
 async function runCrossTenant({ spec, ownUrl, ownKey, token, fetchImpl = (...args) => fetch(...args) }) {
   if (!spec?.trim()) return { skipped: `CROSS_TENANT_TARGETS is not set. ${TARGETS_HINT}` };
   if (!token) return { skipped: 'No resource token was minted.' };
@@ -129,22 +146,31 @@ async function runCrossTenant({ spec, ownUrl, ownKey, token, fetchImpl = (...arg
   const noKey = { status: null, gateway_version: 'unknown', error: 'No publishable or anon key is set for this tenant.' };
   const [control, ...probes] = await Promise.all([
     ownKey ? probeAll(fetchImpl, own.url, ownKey, token) : Object.fromEntries(SERVICES.map((s) => [s.id, noKey])),
-    ...targets.map((t) => probeAll(fetchImpl, t.url, t.key, token)),
+    ...targets.map(async (t) => {
+      const [targetProbes, health] = await Promise.all([probeAll(fetchImpl, t.url, t.key, token), probeHealth(fetchImpl, t.url, t.key)]);
+      return { probes: targetProbes, health };
+    }),
   ]);
   return {
     own: { ...own, control },
-    targets: targets.map((t, i) => ({ ref: t.ref, url: t.url, probes: probes[i] })),
+    targets: targets.map((t, i) => ({ ref: t.ref, url: t.url, probes: probes[i].probes, health: probes[i].health })),
     errors,
   };
 }
 
 const is2xx = (status) => status >= 200 && status < 300;
 
-function classify(service, control, target) {
+function classify(service, control, target, health) {
   const s = target?.status ?? null;
   if (is2xx(s)) return { result: 'accepted' };
   if (s === null) return { result: 'inconclusive', reason: `network error: ${target?.error ?? 'no response'}` };
   if (s >= 500) return { result: 'inconclusive', reason: `HTTP ${s} from the target` };
+  if (!is2xx(health?.status)) {
+    return {
+      result: 'inconclusive',
+      reason: `the target ref or key is not valid in this environment (GET ${HEALTH_PATH} returned ${health?.status ?? health?.error ?? 'no response'})`,
+    };
+  }
   if (!is2xx(control?.status)) {
     return { result: 'inconclusive', reason: `control on this tenant returned ${control?.status ?? control?.error ?? 'no response'}, so the token may be bad` };
   }
@@ -161,7 +187,7 @@ function evaluateService(data, service) {
       gateway_version: p.gateway_version,
       control_status: control?.status ?? null,
       status: p.status,
-      ...classify(service, control, p),
+      ...classify(service, control, p, t.health),
     };
   });
   const accepted = rows.filter((r) => r.result === 'accepted');

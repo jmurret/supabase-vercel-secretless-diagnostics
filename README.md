@@ -7,12 +7,14 @@ Use a Vercel project that has the Supabase Marketplace integration. Then do thes
 1. Link the project: `vercel link`.
 2. Run `pnpm run bootstrap`. The script is safe to run again. It does this:
    - Sets `MARKETPLACE_RESOURCE_ID` to the Supabase resource that is connected to the linked project.
+   - Sets `VERCEL_INTEGRATION_ID` (the `oac_…` ID of the integration), `VERCEL_INTEGRATION_INSTALLATION_ID` (the `icfg_…` installation ID) and `SUPABASE_RESOURCE_ID` (the Supabase project ref). The checks use them for exact matches. If the script cannot find a value, it prints a warning and skips that variable.
    - Warns if `SUPABASE_JWT_SECRET`, `SUPABASE_SECRET_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `POSTGRES_URL`, `POSTGRES_PRISMA_URL`, `POSTGRES_URL_NON_POOLING` or `POSTGRES_PASSWORD` is set on the project. An OIDC-only resource must not sync these static secrets. The script does not remove them, so the `no_static_secret` check can show a resource that syncs them.
    - Reads the Supabase project ref and the integration slug from the Vercel store of the resource. It does not need any Supabase variable value, so the Supabase integration does not need to be connected to the Development environment. The slug `supabase` selects production. The slug `supabase-staging` selects staging. For any other slug, the script asks the Management API with your access token. Without a token, it uses production and prints a warning. To skip this lookup, set `SUPABASE_URL` (for example `https://<ref>.supabase.co`) in the shell before you run the script.
    - Replaces `.env.local` with the Development variables. You need them only to run the app locally. If the integration is not connected to Development, `.env.local` has no Supabase values. The script warns if `POSTGRES_POOLER_HOST` or `SUPABASE_PROJECT_REF` is not set on the Vercel project.
    - Applies the files in `supabase/migrations` (`public.whoami_vercel()` and `public.countries`). It asks once for a Supabase access token. Use an experimental API token. The token is hidden and is not saved. Press Enter to skip it, or set `SUPABASE_ACCESS_TOKEN` to skip the prompt. The schema step checks if the schema exists with the token. Without a token, it checks with the publishable key in `.env.local`, or skips the check. It needs the token to apply the migrations.
    - Offers to enable the Supabase IPv4 add-on when `db.<project host>` has no IPv4 address. The add-on is paid. Without it, the direct login check is skipped on Vercel. If the request fails, the script only prints a warning and the manual command.
    - Enables JIT access and SSL enforcement with the same token, until CTRL-2145 and CTRL-2146 are done. If this fails or you skipped the token, the script only prints a warning. Then run `pnpm run enable-jit`. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
+   - With a terminal, asks for optional cross-tenant targets and sets `CROSS_TENANT_TARGETS`. For each target, it asks for a project ref and a publishable key. It checks that the project accepts the key in the same environment (production or staging) as this project. With an access token, it also prints if the target is in the same organization. Leave the first ref empty to skip. If `CROSS_TENANT_TARGETS` is already set, an empty answer keeps it. See [Cross-tenant checks](#cross-tenant-checks).
    - Redeploys the latest Ready production deployment, because a deployment only sees the variables that existed when it was built. If this fails, the script only prints a warning and the manual command.
 
 ## `GET /`
@@ -120,7 +122,7 @@ The Supabase integration syncs these non-secret Postgres env vars to the Vercel 
 The pooler connection string is `postgres://postgres.<SUPABASE_PROJECT_REF>:<token>@<POSTGRES_POOLER_HOST>:6543/<POSTGRES_DATABASE>?sslmode=require`.
 OIDC-only resources do not get `POSTGRES_URL`, `POSTGRES_PRISMA_URL`, `POSTGRES_URL_NON_POOLING` or `POSTGRES_PASSWORD`.
 
-Optional env vars for exact matches (otherwise the check only validates the format and warns):
+`pnpm run bootstrap` sets these env vars for exact matches. Without them, the check only validates the format and warns:
 
 - `VERCEL_INTEGRATION_ID` (`oac_…`) → expected `iss` = `https://integrations.vercel.com/<id>`
 - `VERCEL_INTEGRATION_INSTALLATION_ID` (`icfg_…`) → expected `aud`
@@ -139,7 +141,7 @@ Set `CROSS_TENANT_TARGETS` to a comma-separated list of `<target>=<key>` entries
 CROSS_TENANT_TARGETS="abcdefghijklmnopqrst=sb_publishable_...,https://zyxwvutsrqponmlkjihg.supabase.co=eyJ..."
 ```
 
-If `CROSS_TENANT_TARGETS` is not set, all cross-tenant checks are skipped. An entry for this deployment's own project ref is a configuration error, because it is not a cross-tenant test.
+`pnpm run bootstrap` can build this list for you. If `CROSS_TENANT_TARGETS` is not set, all cross-tenant checks are skipped. An entry for this deployment's own project ref is a configuration error, because it is not a cross-tenant test.
 
 The probes are:
 
@@ -154,6 +156,7 @@ Each check shows, for each target: the target ref, the gateway version, the cont
 
 - A `2xx` response from another tenant means that the tenant accepted tenant A's token. The check fails with `regression: <service> on <ref> (gateway vN) accepted tenant <A>'s token`.
 - A network error or a `5xx` response is inconclusive. The check warns.
+- Each target also gets `GET /auth/v1/health` with its key as `apikey`. If this is not `2xx`, the target ref or key is not valid in this environment (wrong ref, wrong key, paused project, or a project in the other environment, such as a staging project on a production deployment). A rejection from such a target proves nothing, so the result for that target is inconclusive and the check warns. A `2xx` response to the token is still a regression.
 - The same four probes go to this deployment's own project (own URL and own publishable or anon key) as a positive control. If the control does not return `2xx` for a service, a rejection could mean only that the token is bad. The result for that service is inconclusive and the check warns.
 
 The gateway version comes from the `sb-gateway-version` response header. The values `1` and `1.0` become `v1`, and `2` and `2.0` become `v2`. If the header is missing, the version is `unknown`. `cross_tenant_gateway_coverage` passes when the targets answered with both `v1` and `v2`, and warns otherwise.

@@ -19,11 +19,12 @@ const serviceOf = (url) => SERVICES.find((s) => new URL(url).pathname === PATHS[
 const refOf = (url) => new URL(url).hostname.split('.')[0];
 
 // respond(ref, service) -> { status, version } | Error
-function stubFetch(respond) {
+function stubFetch(respond, health = () => ({ status: 200 })) {
   const calls = [];
   const fetchImpl = async (url, init) => {
     calls.push({ url, init });
-    const r = respond(refOf(url), serviceOf(url));
+    const isHealth = new URL(url).pathname === '/auth/v1/health';
+    const r = isHealth ? health(refOf(url)) : respond(refOf(url), serviceOf(url));
     if (r instanceof Error) throw r;
     const headers = r.version === undefined ? {} : { 'sb-gateway-version': r.version };
     return new Response(r.body ?? '{}', { status: r.status, headers });
@@ -35,9 +36,9 @@ const control200 = (rejectStatus, versions = {}) => (ref, service) =>
   ref === REF ? { status: 200, version: '2' } : { status: rejectStatus(service), version: versions[ref] ?? '2.0' };
 
 async function run(opts) {
-  const { respond, ownKey = 'sb_publishable_own', token = TOKEN } = opts;
+  const { respond, health, ownKey = 'sb_publishable_own', token = TOKEN } = opts;
   const spec = 'spec' in opts ? opts.spec : `${OTHER}=sb_publishable_other`;
-  const { fetchImpl, calls } = stubFetch(respond);
+  const { fetchImpl, calls } = stubFetch(respond, health);
   const ct = await runCrossTenant({ spec, ownUrl: OWN_URL, ownKey, token, fetchImpl });
   return { ct, calls, data: oidcData({ cross_tenant: ct }) };
 }
@@ -98,12 +99,16 @@ test('same-ref target is a config error', async () => {
 
 test('sends the target key as apikey and the token as Bearer', async () => {
   const { calls } = await run({ respond: control200(() => 401) });
-  const target = calls.filter((c) => refOf(c.url) === OTHER);
+  const target = calls.filter((c) => refOf(c.url) === OTHER && serviceOf(c.url));
   assert.equal(target.length, 4);
   for (const c of target) {
     assert.equal(c.init.headers.apikey, 'sb_publishable_other');
     assert.equal(c.init.headers.Authorization, `Bearer ${TOKEN}`);
   }
+  const health = calls.filter((c) => new URL(c.url).pathname === '/auth/v1/health');
+  assert.deepEqual(health.map((c) => refOf(c.url)), [OTHER]);
+  assert.equal(health[0].init.headers.apikey, 'sb_publishable_other');
+  assert.equal(health[0].init.headers.Authorization, undefined);
   const rt = target.find((c) => serviceOf(c.url) === 'realtime');
   assert.equal(rt.init.method, 'POST');
   assert.deepEqual(JSON.parse(rt.init.body).messages[0].private, true);
@@ -132,6 +137,22 @@ for (const service of SERVICES) {
     assert.match(r.detail, new RegExp(`^regression: .+ on ${OTHER} \\(gateway v2\\) accepted tenant ${REF}'s token`));
   });
 }
+
+test('target health failure makes a rejection inconclusive', async () => {
+  for (const health of [() => ({ status: 401 }), () => ({ status: 404 }), () => new Error('ENOTFOUND')]) {
+    const { data } = await run({ respond: control200((s) => STORAGE_REJECT[s]), health });
+    for (const s of SERVICES) {
+      const r = await check(`cross_tenant_${s}`, { data });
+      assert.equal(r.status, 'warn', s);
+      assert.match(r.detail, new RegExp(`${OTHER}: the target ref or key is not valid in this environment \\(GET /auth/v1/health returned `));
+    }
+  }
+});
+
+test('target health failure still reports an accepting target as a regression', async () => {
+  const { data } = await run({ respond: control200(() => 200), health: () => ({ status: 401 }) });
+  assert.equal((await check('cross_tenant_rest', { data })).status, 'fail');
+});
 
 test('control failure makes the result inconclusive', async () => {
   const respond = (ref) => (ref === REF ? { status: 401, version: '2' } : { status: 401, version: '2' });
