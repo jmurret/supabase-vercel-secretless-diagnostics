@@ -14,7 +14,14 @@ const isAuthRejection = (status) => status === 401 || status === 403;
 const isAnyRejection = (status) => status >= 300 && status < 500;
 
 const SERVICES = [
-  { id: 'rest', label: 'REST', method: 'GET', path: '/rest/v1/', expected: 'HTTP 401 or 403', isRejection: isAuthRejection },
+  {
+    id: 'rest',
+    label: 'REST',
+    method: 'GET',
+    path: '/rest/v1/countries?select=*&limit=1',
+    expected: 'HTTP 401 or 403',
+    isRejection: isAuthRejection,
+  },
   {
     id: 'auth_admin',
     label: 'Auth admin',
@@ -86,6 +93,23 @@ function parseTargets(spec, ownUrl) {
   return { own: { ref: ownRef, url: own.origin }, targets, errors };
 }
 
+const redact = (text, secrets) => secrets.filter(Boolean).reduce((out, secret) => out.split(secret).join('<redacted>'), text);
+
+// Only these fields of an error body are kept. Each is redacted before it is cut to length.
+function summarizeError(text, secrets) {
+  const clean = (value) => redact(String(value), secrets).slice(0, MAX_ERROR_CHARS);
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return clean(text);
+  }
+  if (!body || typeof body !== 'object') return clean(text);
+  const pick = (names) =>
+    names.map((n) => body[n]).filter((v) => typeof v === 'string' || typeof v === 'number').map(clean).join(' ');
+  return [pick(['code', 'error_code', 'error']), pick(['msg', 'message'])].filter(Boolean).join(': ');
+}
+
 async function probe(fetchImpl, baseUrl, key, token, service) {
   const started = Date.now();
   try {
@@ -104,14 +128,12 @@ async function probe(fetchImpl, baseUrl, key, token, service) {
     const result = { status: res.status, gateway_version: normalizeGatewayVersion(header), gateway_header: header };
     // A 2xx body from another tenant can hold its data, so only error bodies are kept.
     if (res.ok) await res.body?.cancel?.();
-    else result.error = redact((await res.text()).slice(0, MAX_ERROR_CHARS), token);
+    else result.error = summarizeError(await res.text(), [token, key]);
     return { ...result, ms: Date.now() - started };
   } catch (err) {
-    return { status: null, gateway_version: 'unknown', gateway_header: null, error: redact(err.message, token), ms: Date.now() - started };
+    return { status: null, gateway_version: 'unknown', gateway_header: null, error: redact(err.message, [token, key]).slice(0, MAX_ERROR_CHARS), ms: Date.now() - started };
   }
 }
-
-const redact = (text, token) => (token ? text.split(token).join('<token>') : text);
 
 async function probeAll(fetchImpl, baseUrl, key, token) {
   const results = await Promise.all(SERVICES.map((s) => probe(fetchImpl, baseUrl, key, token, s)));
@@ -163,6 +185,9 @@ const is2xx = (status) => status >= 200 && status < 300;
 function classify(service, control, target, health) {
   const s = target?.status ?? null;
   if (is2xx(s)) return { result: 'accepted' };
+  if (service.id === 'rest' && s === 404 && /PGRST205/.test(target?.error ?? '')) {
+    return { result: 'accepted', reason: 'PostgREST accepted the token and then did not find the table (PGRST205)' };
+  }
   if (s === null) return { result: 'inconclusive', reason: `network error: ${target?.error ?? 'no response'}` };
   if (s >= 500) return { result: 'inconclusive', reason: `HTTP ${s} from the target` };
   if (!is2xx(health?.status)) {
@@ -172,7 +197,11 @@ function classify(service, control, target, health) {
     };
   }
   if (!is2xx(control?.status)) {
-    return { result: 'inconclusive', reason: `control on this tenant returned ${control?.status ?? control?.error ?? 'no response'}, so the token may be bad` };
+    const detail = [control?.status, control?.error].filter((v) => v != null && v !== '').join(' ');
+    return {
+      result: 'inconclusive',
+      reason: `control on this tenant returned ${control?.status ?? control?.error ?? 'no response'}; this tenant does not accept the token for this service either, so a rejection by the target proves nothing${detail ? ` (${detail})` : ''}`,
+    };
   }
   if (service.isRejection(s)) return { result: 'rejected' };
   return { result: 'inconclusive', reason: `unexpected HTTP ${s}` };
@@ -186,7 +215,9 @@ function evaluateService(data, service) {
       target: t.ref,
       gateway_version: p.gateway_version,
       control_status: control?.status ?? null,
+      ...(control?.error && { control_error: control.error }),
       status: p.status,
+      ...(p.error && { error: p.error }),
       ...classify(service, control, p, t.health),
     };
   });

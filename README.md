@@ -147,7 +147,7 @@ The probes are:
 
 | Check | Request | Rejection |
 |---|---|---|
-| `cross_tenant_rest` | `GET /rest/v1/` | `401` or `403` |
+| `cross_tenant_rest` | `GET /rest/v1/countries?select=*&limit=1` | `401` or `403` |
 | `cross_tenant_auth_admin` | `GET /auth/v1/admin/users?per_page=1` | `401` or `403` |
 | `cross_tenant_storage` | `GET /storage/v1/bucket` | any `3xx` or `4xx` (Storage can send `400` with an error body) |
 | `cross_tenant_realtime` | `POST /realtime/v1/api/broadcast` with one private message on topic `cross-tenant-probe` | any `3xx` or `4xx` |
@@ -157,9 +157,9 @@ Each check shows, for each target: the target ref, the gateway version, the cont
 - A `2xx` response from another tenant means that the tenant accepted tenant A's token. The check fails with `regression: <service> on <ref> (gateway vN) accepted tenant <A>'s token`.
 - A network error or a `5xx` response is inconclusive. The check warns.
 - Each target also gets `GET /auth/v1/health` with its key as `apikey`. If this is not `2xx`, the target ref or key is not valid in this environment (wrong ref, wrong key, paused project, or a project in the other environment, such as a staging project on a production deployment). A rejection from such a target proves nothing, so the result for that target is inconclusive and the check warns. A `2xx` response to the token is still a regression.
-- The same four probes go to this deployment's own project (own URL and own publishable or anon key) as a positive control. If the control does not return `2xx` for a service, a rejection could mean only that the token is bad. The result for that service is inconclusive and the check warns.
+- The same four probes go to this deployment's own project (own URL and own publishable or anon key) as a positive control. If the control does not return `2xx` for a service, this tenant does not accept the token for that service either, so a rejection by a target proves nothing. The result for that service is inconclusive and the check warns. The REST probe reads the `public.countries` table, which this project creates in its migrations. Auth admin can be inconclusive if Supabase Auth does not accept resource tokens on this tenant. The control error, such as `401 PGRST301: ...`, shows why.
 
-The gateway version comes from the `sb-gateway-version` response header. The values `1` and `1.0` become `v1`, and `2` and `2.0` become `v2`. If the header is missing, the version is `unknown`. `cross_tenant_gateway_coverage` passes when the targets answered with both `v1` and `v2`, and warns otherwise.
+The gateway version comes from the `sb-gateway-version` response header. The values `1` and `1.0` become `v1`, and `2` and `2.0` become `v2`. If the header is missing, the version is `unknown`. `cross_tenant_gateway_coverage` passes when the targets answered with both `v1` and `v2`, and warns otherwise. The api-gateway v2 does not serve any projects yet. Until it does, no target can answer with `v2`, so this check warns and only `v1` can be checked.
 
 Vercel mints resource tokens only for teams on an allow list. Tenant A (this deployment's Vercel team) must be on an allow-listed team, or no token is minted and the cross-tenant checks are skipped.
 

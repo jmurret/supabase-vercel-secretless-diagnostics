@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { normalizeGatewayVersion, parseTargets, runCrossTenant } = require('../cross-tenant');
+const { SERVICES: PROBES, normalizeGatewayVersion, parseTargets, runCrossTenant, evaluateService } = require('../cross-tenant');
 const { REF, oidcData, check } = require('./helpers');
 
 const OWN_URL = `https://${REF}.supabase.co`;
@@ -9,7 +9,7 @@ const OTHER_V1 = 'qwertyuiopasdfghjklz';
 const TOKEN = 'header.payload.signature';
 const SERVICES = ['rest', 'auth_admin', 'storage', 'realtime'];
 const PATHS = {
-  rest: '/rest/v1/',
+  rest: '/rest/v1/countries',
   auth_admin: '/auth/v1/admin/users',
   storage: '/storage/v1/bucket',
   realtime: '/realtime/v1/api/broadcast',
@@ -42,6 +42,8 @@ async function run(opts) {
   const ct = await runCrossTenant({ spec, ownUrl: OWN_URL, ownKey, token, fetchImpl });
   return { ct, calls, data: oidcData({ cross_tenant: ct }) };
 }
+
+const evaluateRow = (ct, id) => evaluateService(ct, PROBES.find((s) => s.id === id)).rows[0];
 
 const STORAGE_REJECT = { rest: 401, auth_admin: 403, storage: 400, realtime: 401 };
 
@@ -160,8 +162,36 @@ test('control failure makes the result inconclusive', async () => {
   for (const s of SERVICES) {
     const r = await check(`cross_tenant_${s}`, { data });
     assert.equal(r.status, 'warn', s);
-    assert.match(r.detail, /control on this tenant returned 401/);
+    assert.match(r.detail, /control on this tenant returned 401; this tenant does not accept the token for this service either, so a rejection by the target proves nothing/);
   }
+});
+
+test('control and target errors keep a safe summary and no secrets', async () => {
+  const KEY = 'sb_publishable_own';
+  const body = JSON.stringify({
+    code: 'PGRST301',
+    message: `JWT rejected ${TOKEN} with ${KEY}`,
+    details: 'not kept',
+    hint: 'not kept',
+    extra: { nested: TOKEN },
+  });
+  const respond = (ref) => (ref === REF ? { status: 401, body, version: '2' } : { status: 401, body: '{"error_code":"no_authorization","msg":"nope"}', version: '2' });
+  const { ct, data } = await run({ respond });
+  const row = evaluateRow(ct, 'rest');
+  assert.equal(row.control_error, 'PGRST301: JWT rejected <redacted> with <redacted>');
+  assert.equal(row.error, 'no_authorization: nope');
+  const json = JSON.stringify(ct);
+  assert.ok(!json.includes(TOKEN) && !json.includes(KEY) && !json.includes('not kept') && !json.includes('nested'));
+  const r = await check('cross_tenant_rest', { data });
+  assert.equal(r.status, 'warn');
+  assert.match(r.detail, /\(401 PGRST301: JWT rejected <redacted> with <redacted>\)/);
+  assert.ok(!JSON.stringify(r).includes(TOKEN));
+});
+
+test('error summaries are cut to 200 characters per field', async () => {
+  const respond = (ref) => (ref === REF ? { status: 403, body: JSON.stringify({ msg: 'x'.repeat(500) }) } : { status: 401 });
+  const { ct } = await run({ respond });
+  assert.equal(evaluateRow(ct, 'auth_admin').control_error.length, 200);
 });
 
 test('control failure still reports an accepting target as a regression', async () => {
@@ -186,6 +216,17 @@ test('unexpected 4xx is inconclusive for REST and Auth admin but a rejection for
   assert.equal((await check('cross_tenant_storage', { data })).status, 'pass');
 });
 
+test('REST 404 PGRST205 from a target means the token was accepted', async () => {
+  const { data } = await run({
+    respond: (ref, service) => {
+      if (ref === REF) return { status: 200, version: '2' };
+      if (service === 'rest') return { status: 404, version: '1', body: JSON.stringify({ code: 'PGRST205', message: 'missing table' }) };
+      return { status: 401, version: '1' };
+    },
+  });
+  assert.equal((await check('cross_tenant_rest', { data })).status, 'fail');
+});
+
 test('gateway coverage passes with v1 and v2 targets and warns otherwise', async () => {
   const both = await run({
     spec: `${OTHER}=a,${OTHER_V1}=b`,
@@ -199,6 +240,11 @@ test('gateway coverage passes with v1 and v2 targets and warns otherwise', async
   const w = await check('cross_tenant_gateway_coverage', { data: onlyV2.data });
   assert.equal(w.status, 'warn');
   assert.match(w.detail, /gateway v1/);
+
+  const onlyV1 = await run({ respond: control200(() => 401, { [OTHER]: '1' }) });
+  const v = await check('cross_tenant_gateway_coverage', { data: onlyV1.data });
+  assert.equal(v.status, 'warn');
+  assert.equal(v.detail, 'No target is served by api-gateway v2. The v2 gateway does not serve any projects yet, so only v1 can be checked now.');
 
   const none = await run({ respond: (ref) => (ref === REF ? { status: 200 } : { status: 401 }) });
   assert.deepEqual((await check('cross_tenant_gateway_coverage', { data: none.data })).actual.seen, ['unknown']);

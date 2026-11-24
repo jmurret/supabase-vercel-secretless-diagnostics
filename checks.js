@@ -804,9 +804,12 @@ const CHECKS = [
       const expected = ['v1', 'v2'];
       const missing = expected.filter((v) => !seen.includes(v));
       const actual = { seen, targets: perTarget };
-      return missing.length
-        ? warn(expected, actual, `No target answered with gateway ${missing.join(' or ')}. Add a target on that gateway.`)
-        : pass(expected, actual);
+      if (!missing.length) return pass(expected, actual);
+      const v1Detail = 'No target answered with gateway v1. Add a target on that gateway.';
+      const detail = missing.includes('v2')
+        ? `No target is served by api-gateway v2. The v2 gateway does not serve any projects yet, so only v1 can be checked now.${missing.includes('v1') ? ` ${v1Detail}` : ''}`
+        : v1Detail;
+      return warn(expected, actual, detail);
     },
   },
 ];
