@@ -5,6 +5,7 @@ const { Client } = require('pg');
 const { runChecks } = require('../checks');
 const { poolerLoginParams } = require('../pooler');
 const { runCrossTenant } = require('../cross-tenant');
+const { parsePoolerHints } = require('../pooler-discovery');
 
 const URL_ENV_VAR = ['SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_URL'].find((n) => process.env[n]);
 const SUPABASE_URL = URL_ENV_VAR ? process.env[URL_ENV_VAR].replace(/\/+$/, '') : undefined;
@@ -295,8 +296,8 @@ async function runControls(ctx) {
   return { apikey_only: apikeyOnlyResult, tampered_token: tamperedResult };
 }
 
-async function requestJitAccess(token) {
-  const { management_api: mgmt, project_ref: ref } = SUPABASE_URL_INFO;
+async function requestJitAccess(token, ref = SUPABASE_URL_INFO.project_ref) {
+  const { management_api: mgmt } = SUPABASE_URL_INFO;
   if (!mgmt || !ref) return { skipped: 'Supabase URL is not a <ref>.supabase.co host' };
   const started = Date.now();
   try {
@@ -346,9 +347,10 @@ async function loginWithToken(token, { host, port, user, database = 'postgres', 
   }
 }
 
-async function loginPooler(token, options) {
-  const params = poolerLoginParams(process.env, JIT_ROLE);
-  return params.skipped ? params : loginWithToken(token, { ...params, options });
+async function loginPooler(token, options, ref, host, timeoutMs) {
+  const env = host ? { ...process.env, POSTGRES_POOLER_HOST: host } : process.env;
+  const params = poolerLoginParams(env, JIT_ROLE, ref);
+  return params.skipped ? params : loginWithToken(token, { ...params, options, ...(timeoutMs && { timeoutMs }) });
 }
 
 // The direct host has an A record only with the IPv4 add-on, and always has an AAAA record. Prefer IPv4, fall back to IPv6,
@@ -404,6 +406,15 @@ async function runDiagnostics(req, res) {
       ownUrl: SUPABASE_URL,
       ownKey: server.ctx?.apikey,
       token: resourceToken,
+      jit: jitToken
+        ? {
+            token: jitToken,
+            requestJit: (ref) => requestJitAccess(jitToken, ref),
+            poolerHost: process.env.POSTGRES_POOLER_HOST,
+            poolerHints: parsePoolerHints(new URL(req.url ?? '/', 'http://localhost').searchParams.get('pooler_hints')),
+            loginPooler: (ref, host, timeoutMs) => loginPooler(jitToken, '--jit=true', ref, host, timeoutMs),
+          }
+        : noJitToken,
     }),
   ]);
 

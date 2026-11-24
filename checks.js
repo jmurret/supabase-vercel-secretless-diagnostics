@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const { RESYNC_HINT } = require('./pooler');
-const { SERVICES: CROSS_TENANT_SERVICES, evaluateService, gatewayCoverage } = require('./cross-tenant');
+const { SERVICES: CROSS_TENANT_SERVICES, JIT_PROBES, evaluateService, evaluateJitProbe, gatewayCoverage } = require('./cross-tenant');
 
 // Expectations from "Vercel Marketplace OIDC" (Vercel OIDC secretless spec, Nov 18).
 const SPEC = 'Vercel Marketplace OIDC (spec updated Nov 18)';
@@ -190,7 +190,34 @@ function crossTenantServiceCheck(service) {
   };
 }
 
-const NO_ROUTE_CODES = ['ENETUNREACH', 'EHOSTUNREACH', 'EADDRNOTAVAIL', 'ETIMEDOUT'];
+function crossTenantJitCheck(probe) {
+  return {
+    id: `cross_tenant_${probe.id}`,
+    group: 'cross_tenant',
+    description: probe.description,
+    run: (c) => {
+      const s = needCrossTenantTargets(c);
+      if (s) return s;
+      const evaluated = evaluateJitProbe(c.crossTenant, c.jit, probe);
+      if (evaluated.skipped) return skip(evaluated.skipped);
+      const { rows, accepted, inconclusive } = evaluated;
+      const ownRef = c.crossTenant.own.ref;
+      const note = (r) => (r.note ? ` (${r.note})` : '');
+      if (accepted.length) {
+        return fail(probe.expected, rows, accepted
+          .map((r) => `regression: ${probe.label} on ${r.target} accepted tenant ${ownRef}'s JIT token${note(r)}`)
+          .join('; '));
+      }
+      if (inconclusive.length) {
+        return warn(probe.expected, rows, `Inconclusive: ${inconclusive.map((r) => `${r.target}: ${r.reason}${note(r)}`).join('; ')}`);
+      }
+      const notes = rows.filter((r) => r.note).map((r) => `${r.target}: ${r.note}`).join('; ');
+      return pass(probe.expected, rows, notes || undefined);
+    },
+  };
+}
+
+const NO_ROUTE_CODES =['ENETUNREACH', 'EHOSTUNREACH', 'EADDRNOTAVAIL', 'ETIMEDOUT'];
 const isAuthFailure = (r) => r.code === '28P01' || /password authentication failed/.test(r.error);
 const isNoRoute = (r) => NO_ROUTE_CODES.includes(r.code) || r.error === 'timeout expired';
 
@@ -793,6 +820,7 @@ const CHECKS = [
     },
   },
   ...CROSS_TENANT_SERVICES.map(crossTenantServiceCheck),
+  ...JIT_PROBES.map(crossTenantJitCheck),
   {
     id: 'cross_tenant_gateway_coverage',
     group: 'cross_tenant',

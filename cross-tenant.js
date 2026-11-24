@@ -2,7 +2,10 @@
 // them to reject it. Each target also gets its own public key, so that the gateway apikey check
 // passes and only the Bearer token decides.
 
+const { findTargetPooler, isAuthRejection: isPoolerAuthRejection } = require('./pooler-discovery');
+
 const PROBE_TIMEOUT_MS = 5000;
+const JIT_ROLE = 'postgres';
 const GATEWAY_HEADER = 'sb-gateway-version';
 const HEALTH_PATH = '/auth/v1/health';
 const MAX_ERROR_CHARS = 200;
@@ -156,7 +159,48 @@ async function probeHealth(fetchImpl, baseUrl, key) {
   }
 }
 
-async function runCrossTenant({ spec, ownUrl, ownKey, token, fetchImpl = (...args) => fetch(...args) }) {
+const NO_JIT_TOKEN = 'No JIT resource token was minted.';
+const cut = (value, secrets) => redact(String(value), secrets).slice(0, MAX_ERROR_CHARS);
+const withError = (error, secrets) => (error ? { error: cut(error, secrets) } : {});
+
+// Only these fields are kept, and the JIT token is removed from the error text.
+const cleanMgmt = (r, secrets) => (r?.skipped ? { skipped: r.skipped } : { status: r?.status ?? null, ...withError(r?.error, secrets), ms: r?.ms });
+
+async function probeJitPooler(jit, ref, secrets) {
+  const found = await findTargetPooler({
+    ownHost: jit.poolerHost,
+    ref,
+    hint: jit.poolerHints?.[ref],
+    cache: jit.poolerCache,
+    login: (host, timeoutMs) => jit.loginPooler(ref, host, timeoutMs),
+    ...jit.discovery,
+  });
+  if (found.skipped) return { skipped: found.skipped };
+  if (found.none) return { hosts_tried: found.tried, error: cut(found.error, secrets) };
+  const { current_user: currentUser, code, error, ms } = found.result;
+  return {
+    ...(currentUser && { current_user: currentUser }),
+    ...(code && { code }),
+    ...withError(error, secrets),
+    ms,
+    pooler_host: found.host,
+    hosts_tried: found.tried,
+    source: found.source,
+  };
+}
+
+// The JIT token goes to the Management API and the pooler of each target. Neither answer keeps a body.
+async function jitProbes(jit, ref) {
+  if (!jit?.token) {
+    const skipped = { skipped: jit?.skipped ?? NO_JIT_TOKEN };
+    return { jit_mgmt: skipped, jit_pooler: skipped };
+  }
+  const secrets = [jit.token];
+  const [mgmt, pooler] = await Promise.all([jit.requestJit(ref), probeJitPooler(jit, ref, secrets)]);
+  return { jit_mgmt: cleanMgmt(mgmt, secrets), jit_pooler: pooler };
+}
+
+async function runCrossTenant({ spec, ownUrl, ownKey, token, jit, fetchImpl = (...args) => fetch(...args) }) {
   if (!spec?.trim()) return { skipped: `CROSS_TENANT_TARGETS is not set. ${TARGETS_HINT}` };
   if (!token) return { skipped: 'No resource token was minted.' };
   try {
@@ -169,13 +213,17 @@ async function runCrossTenant({ spec, ownUrl, ownKey, token, fetchImpl = (...arg
   const [control, ...probes] = await Promise.all([
     ownKey ? probeAll(fetchImpl, own.url, ownKey, token) : Object.fromEntries(SERVICES.map((s) => [s.id, noKey])),
     ...targets.map(async (t) => {
-      const [targetProbes, health] = await Promise.all([probeAll(fetchImpl, t.url, t.key, token), probeHealth(fetchImpl, t.url, t.key)]);
-      return { probes: targetProbes, health };
+      const [targetProbes, health, jitResults] = await Promise.all([
+        probeAll(fetchImpl, t.url, t.key, token),
+        probeHealth(fetchImpl, t.url, t.key),
+        jitProbes(jit, t.ref),
+      ]);
+      return { probes: targetProbes, health, jitResults };
     }),
   ]);
   return {
     own: { ...own, control },
-    targets: targets.map((t, i) => ({ ref: t.ref, url: t.url, probes: probes[i].probes, health: probes[i].health })),
+    targets: targets.map((t, i) => ({ ref: t.ref, url: t.url, probes: probes[i].probes, health: probes[i].health, ...probes[i].jitResults })),
     errors,
   };
 }
@@ -226,6 +274,102 @@ function evaluateService(data, service) {
   return { rows, accepted, inconclusive };
 }
 
+const MGMT_JIT_REJECTIONS = [401, 403, 404];
+
+function classifyMgmtJit(control, target) {
+  const s = target.status ?? null;
+  if (is2xx(s)) return { result: 'accepted' };
+  if (s === null) return { result: 'inconclusive', reason: `network error: ${target.error ?? 'no response'}` };
+  if (s >= 500) return { result: 'inconclusive', reason: `HTTP ${s} from the Management API` };
+  if (!is2xx(control?.status)) {
+    const detail = [control?.status, control?.error ?? control?.skipped].filter((v) => v != null && v !== '').join(' ');
+    return {
+      result: 'inconclusive',
+      reason: `the JIT grant for this tenant (jit_management_api) did not succeed, so a rejection of the target proves nothing${detail ? ` (${detail})` : ''}`,
+    };
+  }
+  if (MGMT_JIT_REJECTIONS.includes(s)) return { result: 'rejected' };
+  return { result: 'inconclusive', reason: `unexpected HTTP ${s}` };
+}
+
+function classifyPoolerLogin(control, target) {
+  if (target.current_user) return { result: 'accepted' };
+  if (!isPoolerAuthRejection(target)) return { result: 'inconclusive', reason: target.error ?? 'no answer from a pooler' };
+  if (control?.current_user !== JIT_ROLE) {
+    const detail = control?.current_user ?? control?.error ?? control?.skipped ?? 'no result';
+    return {
+      result: 'inconclusive',
+      reason: `the JIT pooler login for this tenant (jit_postgres_login) did not run as ${JIT_ROLE}, so a rejection by the target proves nothing (${detail})`,
+    };
+  }
+  return { result: 'rejected' };
+}
+
+const poolerNote = (p) =>
+  p.pooler_host && `answered by ${p.pooler_host} (${p.hosts_tried} ${p.hosts_tried === 1 ? 'host' : 'hosts'} tried, from ${p.source})`;
+
+const JIT_PROBES = [
+  {
+    id: 'mgmt_jit',
+    label: 'Management API JIT grant',
+    description: `Management API does not grant JIT access to other tenants for this tenant's JIT token (POST /v1/projects/<target ref>/database/jit, role ${JIT_ROLE})`,
+    expected: 'HTTP 401, 403 or 404 from every target',
+    field: 'jit_mgmt',
+    control: (jit) => jit?.management_api,
+    classify: classifyMgmtJit,
+    row: (control, p) => ({
+      control_status: control?.status ?? null,
+      ...((control?.error ?? control?.skipped) && { control_error: control.error ?? control.skipped }),
+      status: p.status,
+      ...(p.error && { error: p.error }),
+    }),
+  },
+  {
+    id: 'pooler_login',
+    label: 'pooler login',
+    description: `Pooler login to other tenants (user ${JIT_ROLE}.<target ref>, --jit=true) fails for this tenant's JIT token`,
+    expected: 'authentication error from the target pooler for every target',
+    field: 'jit_pooler',
+    control: (jit) => jit?.postgres_login,
+    classify: classifyPoolerLogin,
+    row: (control, p) => ({
+      control_current_user: control?.current_user ?? null,
+      ...((control?.error ?? control?.skipped) && { control_error: control.error ?? control.skipped }),
+      ...(p.current_user && { current_user: p.current_user }),
+      ...(p.code && { code: p.code }),
+      ...(p.error && { error: p.error }),
+      ...(p.pooler_host && { pooler_host: p.pooler_host, source: p.source }),
+      hosts_tried: p.hosts_tried ?? null,
+      ...(poolerNote(p) && { note: poolerNote(p) }),
+    }),
+  },
+];
+
+function evaluateJitProbe(data, jit, probe) {
+  const control = probe.control(jit);
+  const answered = data.targets.filter((t) => t[probe.field] && !t[probe.field].skipped);
+  if (!answered.length) {
+    return { skipped: data.targets.map((t) => t[probe.field]?.skipped).find(Boolean) ?? 'JIT probes were not run.' };
+  }
+  const rows = answered.map((t) => {
+    const p = t[probe.field];
+    const verdict = probe.classify(control, p);
+    const healthBad = verdict.result !== 'accepted' && t.health && !is2xx(t.health.status);
+    const health = healthBad
+      ? {
+          result: 'inconclusive',
+          reason: `the target ref or key is not valid in this environment (GET ${HEALTH_PATH} returned ${t.health.status ?? t.health.error ?? 'no response'})`,
+        }
+      : verdict;
+    return { target: t.ref, ...probe.row(control, p), ...health };
+  });
+  return {
+    rows,
+    accepted: rows.filter((r) => r.result === 'accepted'),
+    inconclusive: rows.filter((r) => r.result === 'inconclusive'),
+  };
+}
+
 function gatewayCoverage(data) {
   const perTarget = data.targets.map((t) => ({
     target: t.ref,
@@ -237,9 +381,11 @@ function gatewayCoverage(data) {
 
 module.exports = {
   SERVICES,
+  JIT_PROBES,
   normalizeGatewayVersion,
   parseTargets,
   runCrossTenant,
   evaluateService,
+  evaluateJitProbe,
   gatewayCoverage,
 };

@@ -118,16 +118,43 @@ module.exports = `<!DOCTYPE html>
       return button;
     }
 
+    const HINTS_KEY = 'pooler_hints';
+
+    function readHints() {
+      try {
+        const hints = JSON.parse(localStorage.getItem(HINTS_KEY));
+        return hints && typeof hints === 'object' ? hints : {};
+      } catch {
+        return {};
+      }
+    }
+
+    function saveHints(targets) {
+      try {
+        const hints = readHints();
+        for (const t of targets || []) {
+          if (t.jit_pooler && t.jit_pooler.pooler_host) hints[t.ref] = t.jit_pooler.pooler_host;
+        }
+        localStorage.setItem(HINTS_KEY, JSON.stringify(hints));
+      } catch {}
+    }
+
+    function hintsQuery() {
+      const pairs = Object.entries(readHints()).map(([ref, host]) => ref + ':' + host);
+      return pairs.length ? '?pooler_hints=' + encodeURIComponent(pairs.join(',')) : '';
+    }
+
     async function load() {
       const main = document.getElementById('checks');
       const summary = document.getElementById('summary');
       const meta = document.getElementById('meta');
       try {
-        const res = await fetch('/api/diagnostics', { cache: 'no-store', headers: { accept: 'application/json' } });
+        const res = await fetch('/api/diagnostics' + hintsQuery(), { cache: 'no-store', headers: { accept: 'application/json' } });
         const body = await res.json();
         document.getElementById('raw').textContent = JSON.stringify(body, null, 2);
         if (!res.ok) throw new Error(body.error || 'HTTP ' + res.status);
         const { checks, data } = body;
+        saveHints(data.cross_tenant && data.cross_tenant.targets);
         const s = checks.summary;
         summary.replaceChildren(
           pill(s.status, 'Overall: ' + LABELS[s.status], 'all'),

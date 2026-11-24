@@ -14,6 +14,12 @@ test('builds pooler login parameters from the synced env vars', () => {
   });
 });
 
+test('builds the user from an explicit ref', () => {
+  const p = poolerLoginParams({ POSTGRES_POOLER_HOST: HOST }, 'postgres', 'zyxwvutsrqponmlkjihg');
+  assert.equal(p.user, 'postgres.zyxwvutsrqponmlkjihg');
+  assert.equal(p.host, HOST);
+});
+
 test('uses POSTGRES_DATABASE when set', () => {
   const p = poolerLoginParams({ POSTGRES_POOLER_HOST: HOST, SUPABASE_PROJECT_REF: REF, POSTGRES_DATABASE: 'app' }, 'postgres');
   assert.equal(p.database, 'app');
