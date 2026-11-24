@@ -3,6 +3,7 @@ const { getVercelOidcToken } = require('@vercel/functions/oidc');
 const dns = require('node:dns');
 const { Client } = require('pg');
 const { runChecks } = require('../checks');
+const { poolerLoginParams } = require('../pooler');
 
 const URL_ENV_VAR = ['SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_URL'].find((n) => process.env[n]);
 const SUPABASE_URL = URL_ENV_VAR ? process.env[URL_ENV_VAR].replace(/\/+$/, '') : undefined;
@@ -318,21 +319,8 @@ async function requestJitAccess(token) {
   }
 }
 
-// Logs in to Postgres with the resource token as the password; the password in POSTGRES_URL is ignored.
-// Without an explicit host, host, port and user come from POSTGRES_URL.
-async function loginWithToken(token, { host, port, user, options, servername, endpoint, timeoutMs = 10_000 } = {}) {
-  if (!host) {
-    if (!process.env.POSTGRES_URL) return { skipped: 'POSTGRES_URL is not set' };
-    let url;
-    try {
-      url = new URL(process.env.POSTGRES_URL);
-    } catch {
-      return { skipped: 'POSTGRES_URL is not a valid URL' };
-    }
-    host = url.hostname;
-    port = Number(url.port) || 5432;
-    user = decodeURIComponent(url.username);
-  }
+// Logs in to Postgres with the resource token as the password.
+async function loginWithToken(token, { host, port, user, database = 'postgres', options, servername, endpoint, timeoutMs = 10_000 }) {
   endpoint ??= `${host}:${port}`;
   const client = new Client({
     host,
@@ -340,7 +328,7 @@ async function loginWithToken(token, { host, port, user, options, servername, en
     user,
     password: token,
     ...(options && { options }),
-    database: 'postgres',
+    database,
     ssl: { rejectUnauthorized: false, ...(servername && { servername }) },
     connectionTimeoutMillis: timeoutMs,
   });
@@ -355,6 +343,11 @@ async function loginWithToken(token, { host, port, user, options, servername, en
   } finally {
     await client.end().catch(() => {});
   }
+}
+
+async function loginPooler(token, options) {
+  const params = poolerLoginParams(process.env, JIT_ROLE);
+  return params.skipped ? params : loginWithToken(token, { ...params, options });
 }
 
 // The direct host has an A record only with the IPv4 add-on, and always has an AAAA record. Prefer IPv4, fall back to IPv6,
@@ -401,8 +394,8 @@ async function runDiagnostics(req, res) {
     jitToken ? requestJitAccess(jitToken) : noJitToken,
     // Control: the default-role (service_role) token must not get JIT access to JIT_ROLE.
     resourceToken ? requestJitAccess(resourceToken) : noToken,
-    jitToken ? loginWithToken(jitToken, { options: '--jit=true' }) : noJitToken,
-    jitToken ? loginWithToken(jitToken) : noJitToken,
+    jitToken ? loginPooler(jitToken, '--jit=true') : noJitToken,
+    jitToken ? loginPooler(jitToken) : noJitToken,
     jitToken && directHost ? loginDirect(jitToken, directHost) : noJitToken,
     describeEndUser(req),
   ]);

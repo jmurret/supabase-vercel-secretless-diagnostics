@@ -50,8 +50,11 @@ and deployable as a Vercel function). Returns JSON (non-secret) shaped as `{ "da
   `management_api` is `POST <management api>/v1/projects/<ref>/database/jit` (role `postgres`).
   `management_api_default_role` is the same request with the default-role (`service_role`) token.
   It is a control: the Management API must reject it, because the token role is not `postgres`.
-  `postgres_login` logs in to the host/port/user from `POSTGRES_URL` with the JIT token as the
-  password and the startup option `--jit=true` (the static password in `POSTGRES_URL` is ignored).
+  `postgres_login` logs in to the pooler with the JIT token as the password and the startup option
+  `--jit=true`. It uses host `POSTGRES_POOLER_HOST`, port 6543, user `postgres.<SUPABASE_PROJECT_REF>`
+  and database `POSTGRES_DATABASE` (default `postgres`). It does not use `POSTGRES_URL`. OIDC-only
+  resources do not get `POSTGRES_URL`. If `POSTGRES_POOLER_HOST` or `SUPABASE_PROJECT_REF` is not
+  set, the login is not attempted: resync the Supabase integration environment variables in Vercel.
   `postgres_login_no_jit` is the same login without the option. `direct_login` logs in as `postgres`
   to `db.<project host>`. It uses the IPv4 address when the host has one (Supabase IPv4 add-on),
   and the IPv6 address otherwise. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
@@ -95,13 +98,23 @@ or the runtime cannot run the check). `summary.status` is the worst of `fail`, `
 
 | Group | Checks |
 |---|---|
-| `config` | `supabase_url`, `apikey_public` (no secret/service-role key in the `apikey` header), `resource_id` (`store_…` / `ir_…`) |
-| `path` | `auth_path` (OIDC path in use), `no_static_secret` (warn if a service-role/secret key or `SUPABASE_JWT_SECRET` is set, under any env var name) |
+| `config` | `supabase_url`, `apikey_public` (no secret/service-role key in the `apikey` header), `resource_id` (`store_…` / `ir_…`), `pooler_host` (`POSTGRES_POOLER_HOST` is a host name only and contains `.pooler.`), `project_ref` (`SUPABASE_PROJECT_REF` is 20 lowercase letters and equals the ref in `SUPABASE_URL`) |
+| `path` | `auth_path` (OIDC path in use), `no_static_secret` (fail if `POSTGRES_URL`, `POSTGRES_PRISMA_URL`, `POSTGRES_URL_NON_POOLING` or `POSTGRES_PASSWORD` is set; warn if a service-role/secret key or `SUPABASE_JWT_SECRET` is set, under any env var name; reports env var names only) |
 | `vercel_oidc` | `oidc_present`, `oidc_iss`, `oidc_alg_kid` (RS256 + kid), `oidc_not_expired`, `oidc_owner_project`, `oidc_team` (`VERCEL_TEAM_ID`, if set, = `owner_id`) |
 | `mint` | `mint_ok` (with hints for spec error codes such as `resource_oidc_not_enabled`) |
 | `resource_token` | `resource_alg_kid`, `resource_required_claims` (aud, sub, act, iat, nbf, exp), `resource_iss`, `resource_aud`, `resource_sub`, `resource_sub_project` (sub = project ref in `SUPABASE_URL`), `resource_role` (`service_role`), `resource_act` (act.sub = deployment OIDC sub), `resource_environment`, `resource_time` (60 s tolerance), `resource_lifetime` (≤ 15 min), `resource_size` (≤ 4 KB), `resource_signature` (verified against `<iss>/jwks.json`) |
 | `database` | `db_accepted` (PGRST301 → add the issuer as a Custom OIDC third-party provider), `db_role` (runs as `service_role`), `db_claims_match`, `db_rls_bypass` (`service_role` bypasses RLS), `db_table_access`, `db_anon_control` (apikey only → `anon`), `db_tampered_rejected` (tampered token → `401 PGRST301`) |
-| `jit` | `jit_token_role` (the token minted with `?role=postgres` has the role `postgres`), `jit_management_api` (Management API grants JIT access), `jit_default_role_rejected` (Management API rejects JIT access for the default-role token with `403 Token role does not match requested role`), `jit_postgres_login` (pooler login with the JIT token and `--jit=true` runs as `postgres`), `jit_postgres_login_no_jit` (pooler login without `--jit=true`; this check fails until CTRL-2151 is done), `jit_direct_login` (direct login runs as `postgres`; uses the IPv4 address when the host has one, else IPv6; skipped when the host has only an IPv6 address and the runtime has no IPv6 route) |
+| `jit` | `jit_token_role` (the token minted with `?role=postgres` has the role `postgres`), `jit_management_api` (Management API grants JIT access), `jit_default_role_rejected` (Management API rejects JIT access for the default-role token with `403 Token role does not match requested role`), `jit_postgres_login` (pooler login to `POSTGRES_POOLER_HOST:6543` as `postgres.<SUPABASE_PROJECT_REF>` with the JIT token and `--jit=true` runs as `postgres`), `jit_postgres_login_no_jit` (pooler login without `--jit=true`; this check fails until CTRL-2151 is done), `jit_direct_login` (direct login runs as `postgres`; uses the IPv4 address when the host has one, else IPv6; skipped when the host has only an IPv6 address and the runtime has no IPv6 route) |
+
+The Supabase integration syncs these non-secret Postgres env vars to the Vercel project. The pooler checks use them:
+
+- `POSTGRES_POOLER_HOST`: the pooler host name, for example `aws-0-us-east-1.pooler.supabase.com`.
+- `SUPABASE_PROJECT_REF`: the project ref (20 lowercase letters).
+- `POSTGRES_DATABASE`: the database name (`postgres`).
+- `POSTGRES_HOST`: the direct host (`db.<ref>.supabase.co`).
+
+The pooler connection string is `postgres://postgres.<SUPABASE_PROJECT_REF>:<token>@<POSTGRES_POOLER_HOST>:6543/<POSTGRES_DATABASE>?sslmode=require`.
+OIDC-only resources do not get `POSTGRES_URL`, `POSTGRES_PRISMA_URL`, `POSTGRES_URL_NON_POOLING` or `POSTGRES_PASSWORD`.
 
 Optional env vars for exact matches (otherwise the check only validates the format and warns):
 

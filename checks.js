@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { RESYNC_HINT } = require('./pooler');
 
 // Expectations from "Vercel Marketplace OIDC" (Vercel OIDC secretless spec, Nov 18).
 const SPEC = 'Vercel Marketplace OIDC (spec updated Nov 18)';
@@ -17,7 +18,11 @@ const STATIC_SECRET_ENV_VARS = [
   ...SECRET_ENV_VARS, 'SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY',
   'SUPABASE_PUBLISHABLE_KEY', 'NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY',
 ];
+// These carry the static database password; OIDC-only resources must not get them.
+const POSTGRES_SECRET_ENV_VARS = ['POSTGRES_URL', 'POSTGRES_PRISMA_URL', 'POSTGRES_URL_NON_POOLING', 'POSTGRES_PASSWORD'];
 const RESOURCE_ID_RE = /^(store|ir)_/;
+const HOSTNAME_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i;
+const PROJECT_REF_RE = /^[a-z]{20}$/;
 const JIT_ROLE = 'postgres';
 const MISSING_RELATION_CODES = ['PGRST205', '42P01'];
 const MISSING_FUNCTION_CODES = ['PGRST202', '42883'];
@@ -196,6 +201,35 @@ const CHECKS = [
     },
   },
   {
+    id: 'pooler_host',
+    group: 'config',
+    description: 'POSTGRES_POOLER_HOST is set to a pooler host name (no scheme, port or path)',
+    run: (c) => {
+      const host = c.env.POSTGRES_POOLER_HOST;
+      const expected = '<provider>-<cluster>-<region>.pooler.<domain>';
+      if (!host) return fail(expected, null, `POSTGRES_POOLER_HOST is not set. ${RESYNC_HINT}`);
+      if (!HOSTNAME_RE.test(host)) return fail(expected, host, 'Set it to the host name only, without a scheme, port or path.');
+      if (!host.includes('.pooler.')) return fail(expected, host, 'The host name does not contain ".pooler.".');
+      return pass(expected, host);
+    },
+  },
+  {
+    id: 'project_ref',
+    group: 'config',
+    description: 'SUPABASE_PROJECT_REF is set to a project ref that matches SUPABASE_URL',
+    run: (c) => {
+      const ref = c.env.SUPABASE_PROJECT_REF;
+      const urlRef = c.url?.project_ref ?? null;
+      const expected = urlRef ?? '20 lowercase letters';
+      if (!ref) return fail(expected, null, `SUPABASE_PROJECT_REF is not set. ${RESYNC_HINT}`);
+      if (!PROJECT_REF_RE.test(ref)) return fail(expected, ref, 'A project ref is 20 lowercase letters.');
+      if (!urlRef) return warn(expected, ref, 'SUPABASE_URL is not a <ref>.supabase.co host, so the ref cannot be compared.');
+      return ref === urlRef
+        ? pass(expected, ref)
+        : fail(expected, ref, 'SUPABASE_PROJECT_REF and SUPABASE_URL point to different Supabase projects.');
+    },
+  },
+  {
     id: 'auth_path',
     group: 'path',
     description: 'Server talks to Supabase with a Vercel Marketplace OIDC resource token, not static keys',
@@ -207,7 +241,7 @@ const CHECKS = [
   {
     id: 'no_static_secret',
     group: 'path',
-    description: 'No long-lived Supabase secret keys are present (oidc-only resources have no static secrets)',
+    description: 'No long-lived Supabase secret keys or Postgres passwords are present (oidc-only resources have no static secrets)',
     run: (c) => {
       const present = STATIC_SECRET_ENV_VARS.filter((n) => c.env[n]);
       // Names only; also catches secret keys stored under other env var names.
@@ -215,6 +249,11 @@ const CHECKS = [
         ...SECRET_ENV_VARS.filter((n) => c.env[n]),
         ...Object.keys(c.env).filter((n) => isSecretValue(c.env[n])),
       ])].sort();
+      const postgres = POSTGRES_SECRET_ENV_VARS.filter((n) => c.env[n]);
+      if (postgres.length) {
+        return fail('no secret key env vars', [...secret, ...postgres],
+          `Static database password env vars are set: ${postgres.join(', ')}. OIDC-only resources do not get them; remove them from the Vercel project.`);
+      }
       if (secret.length) return warn('no secret key env vars', secret, 'A service-role/secret key or JWT secret is still configured.');
       return pass('no secret key env vars', present.length ? `only public keys: ${present.join(', ')}` : 'none');
     },
@@ -650,7 +689,7 @@ const CHECKS = [
   {
     id: 'jit_postgres_login',
     group: 'jit',
-    description: `Postgres login through POSTGRES_URL's host with the JIT token as the password and the --jit=true option runs as ${JIT_ROLE}`,
+    description: `Postgres login through the pooler (POSTGRES_POOLER_HOST:6543, user ${JIT_ROLE}.<SUPABASE_PROJECT_REF>) with the JIT token as the password and the --jit=true option runs as ${JIT_ROLE}`,
     run: (c) => {
       const s = needJitToken(c);
       if (s) return s;
@@ -667,7 +706,7 @@ const CHECKS = [
   {
     id: 'jit_postgres_login_no_jit',
     group: 'jit',
-    description: `Postgres login through POSTGRES_URL's host with the JIT token as the password and without the --jit=true option (CTRL-2151)`,
+    description: `Postgres login through the pooler (POSTGRES_POOLER_HOST:6543) with the JIT token as the password and without the --jit=true option (CTRL-2151)`,
     run: (c) => {
       const s = needJitToken(c);
       if (s) return s;
