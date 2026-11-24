@@ -15,7 +15,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 environments="production,preview,development"
-secrets=(SUPABASE_JWT_SECRET SUPABASE_SECRET_KEY SUPABASE_SERVICE_ROLE_KEY)
+secrets=(
+  SUPABASE_JWT_SECRET SUPABASE_SECRET_KEY SUPABASE_SERVICE_ROLE_KEY
+  POSTGRES_URL POSTGRES_PRISMA_URL POSTGRES_URL_NON_POOLING POSTGRES_PASSWORD
+)
 hl="" reset=""
 if [ -t 2 ]; then hl=$'\033[1;33m'; reset=$'\033[0m'; fi
 
@@ -96,7 +99,9 @@ EOF
     exit 1
     ;;
 esac
-[ -n "$(env_value POSTGRES_URL)" ] || echo "Warning: POSTGRES_URL is not set. The JIT login checks need it from the Supabase integration." >&2
+for name in POSTGRES_POOLER_HOST SUPABASE_PROJECT_REF; do
+  [ -n "$(env_value "$name")" ] || echo "Warning: $name is not set. The JIT login checks need it. Resync the Supabase integration env vars." >&2
+done
 
 echo >&2
 echo "==> Step 2: Supabase access token" >&2
