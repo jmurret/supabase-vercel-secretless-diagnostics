@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
-# Enable JIT database access on the Supabase project in .env.local.
+# Enable JIT database access on the Supabase project in SUPABASE_URL.
 # Workaround until the platform does this for Vercel Marketplace resources
 # (CTRL-2145, CTRL-2146). Safe to run many times.
-# Needs: curl, node, a .env.local from `pnpm run bootstrap`, and an
-# experimental API token.
+# `pnpm run bootstrap` sets SUPABASE_URL for this script. To run it alone, set
+# SUPABASE_URL in the shell, or have it in .env.local. Use *.supabase.red for staging.
+# Needs: curl, node, and an experimental API token.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 hl="" reset=""
 if [ -t 2 ]; then hl=$'\033[1;33m'; reset=$'\033[0m'; fi
 
-[ -f .env.local ] || { echo "Run 'pnpm run bootstrap' first." >&2; exit 1; }
-url="$(grep -E '^SUPABASE_URL=' .env.local | tail -n 1 | cut -d= -f2- | sed -E 's/^"(.*)"$/\1/' || true)"
+url="${SUPABASE_URL:-}"
+if [ -z "$url" ] && [ -f .env.local ]; then
+  url="$(grep -E '^SUPABASE_URL=' .env.local | tail -n 1 | cut -d= -f2- | sed -E 's/^"(.*)"$/\1/' || true)"
+fi
 host="${url#*://}"
 host="${host%%/*}"
 ref="${host%%.*}"
-[ -n "$ref" ] || { echo "SUPABASE_URL is not in .env.local." >&2; exit 1; }
+[ -n "$ref" ] || { echo "SUPABASE_URL is not set and .env.local has none. Set SUPABASE_URL (for example https://<ref>.supabase.co) or run 'pnpm run bootstrap'." >&2; exit 1; }
 case "$host" in
   *.supabase.red) mgmt=https://api.supabase.green dashboard=https://supabase.green/dashboard ;;
   *) mgmt=https://api.supabase.com dashboard=https://supabase.com/dashboard ;;

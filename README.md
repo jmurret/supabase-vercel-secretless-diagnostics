@@ -8,8 +8,9 @@ Use a Vercel project that has the Supabase Marketplace integration. Then do thes
 2. Run `pnpm run bootstrap`. The script is safe to run again. It does this:
    - Sets `MARKETPLACE_RESOURCE_ID` to the Supabase resource that is connected to the linked project.
    - Warns if `SUPABASE_JWT_SECRET`, `SUPABASE_SECRET_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `POSTGRES_URL`, `POSTGRES_PRISMA_URL`, `POSTGRES_URL_NON_POOLING` or `POSTGRES_PASSWORD` is set on the project. An OIDC-only resource must not sync these static secrets. The script does not remove them, so the `no_static_secret` check can show a resource that syncs them.
-   - Replaces `.env.local` with the Development variables. It warns if `POSTGRES_POOLER_HOST` or `SUPABASE_PROJECT_REF` is not set.
-   - Applies the files in `supabase/migrations` (`public.whoami_vercel()` and `public.countries`). It asks once for a Supabase access token. Use an experimental API token. The token is hidden and is not saved. Press Enter to skip it, or set `SUPABASE_ACCESS_TOKEN` to skip the prompt. The schema step needs the token when the schema is missing.
+   - Reads the Supabase project ref and the integration slug from the Vercel store of the resource. It does not need any Supabase variable value, so the Supabase integration does not need to be connected to the Development environment. The slug `supabase` selects production. The slug `supabase-staging` selects staging. For any other slug, the script asks the Management API with your access token. Without a token, it uses production and prints a warning. To skip this lookup, set `SUPABASE_URL` (for example `https://<ref>.supabase.co`) in the shell before you run the script.
+   - Replaces `.env.local` with the Development variables. You need them only to run the app locally. If the integration is not connected to Development, `.env.local` has no Supabase values. The script warns if `POSTGRES_POOLER_HOST` or `SUPABASE_PROJECT_REF` is not set on the Vercel project.
+   - Applies the files in `supabase/migrations` (`public.whoami_vercel()` and `public.countries`). It asks once for a Supabase access token. Use an experimental API token. The token is hidden and is not saved. Press Enter to skip it, or set `SUPABASE_ACCESS_TOKEN` to skip the prompt. The schema step checks if the schema exists with the token. Without a token, it checks with the publishable key in `.env.local`, or skips the check. It needs the token to apply the migrations.
    - Offers to enable the Supabase IPv4 add-on when `db.<project host>` has no IPv4 address. The add-on is paid. Without it, the direct login check is skipped on Vercel. If the request fails, the script only prints a warning and the manual command.
    - Enables JIT access and SSL enforcement with the same token, until CTRL-2145 and CTRL-2146 are done. If this fails or you skipped the token, the script only prints a warning. Then run `pnpm run enable-jit`. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
    - Redeploys the latest Ready production deployment, because a deployment only sees the variables that existed when it was built. If this fails, the script only prints a warning and the manual command.
@@ -169,7 +170,7 @@ The JIT checks need JIT access and SSL enforcement on the Supabase project. The 
 
 `pnpm run bootstrap` enables both when it has an access token. To run only this step, for example after you skipped the token:
 
-1. Do the steps in [Set up](#set-up) to link the project and pull `.env.local` (`pnpm run bootstrap`).
+1. Set `SUPABASE_URL` in the shell (for example `https://<ref>.supabase.co`, or `https://<ref>.supabase.red` for staging), or have it in `.env.local`.
 2. Run `pnpm run enable-jit`.
 
 The script needs an experimental API token. It enables SSL enforcement, then JIT access, and waits until the change is applied. It is safe to run again.
