@@ -2,9 +2,15 @@
 // them to reject it. Each target also gets its own public key, so that the gateway apikey check
 // passes and only the Bearer token decides.
 
-const { findTargetPooler, isAuthRejection: isPoolerAuthRejection } = require('./pooler-discovery');
+const { randomBytes } = require('node:crypto');
+const { findTargetPooler, isAuthRejection: isPoolerAuthRejection, poolerRegion, poolerHostCache } = require('./pooler-discovery');
+const { signRequest, EMPTY_PAYLOAD_SHA256 } = require('./sigv4');
 
 const PROBE_TIMEOUT_MS = 5000;
+const REALTIME_TIMEOUT_MS = 8000;
+const S3_PATH = '/storage/v1/s3/';
+const DEFAULT_S3_REGION = 'us-east-1';
+const S3_CREDENTIAL_CODES = ['SignatureDoesNotMatch', 'InvalidAccessKeyId', 'InvalidSignature'];
 const JIT_ROLE = 'postgres';
 const GATEWAY_HEADER = 'sb-gateway-version';
 const HEALTH_PATH = '/auth/v1/health';
@@ -42,6 +48,24 @@ const SERVICES = [
     body: { messages: [{ topic: 'cross-tenant-probe', event: 'probe', payload: {}, private: true }] },
     expected: 'non-2xx',
     isRejection: isAnyRejection,
+  },
+  {
+    id: 'storage_s3',
+    label: 'Storage S3',
+    request: `GET ${S3_PATH} (S3 ListBuckets, AWS SigV4, session token)`,
+    expected: 'HTTP 401 or 403',
+    isRejection: isAuthRejection,
+    noGateway: true,
+    probe: probeS3,
+  },
+  {
+    id: 'realtime_ws',
+    label: 'Realtime websocket',
+    request: 'websocket join of a private channel',
+    expected: 'CHANNEL_ERROR',
+    noGateway: true,
+    probe: probeRealtime,
+    classify: classifyRealtime,
   },
 ];
 
@@ -138,8 +162,96 @@ async function probe(fetchImpl, baseUrl, key, token, service) {
   }
 }
 
-async function probeAll(fetchImpl, baseUrl, key, token) {
-  const results = await Promise.all(SERVICES.map((s) => probe(fetchImpl, baseUrl, key, token, s)));
+const xmlField = (text, name) => new RegExp(`<${name}>([^<]*)</${name}>`).exec(text)?.[1];
+
+// S3 errors are XML with a Code and a Message. Errors from the api-gateway are JSON.
+function summarizeS3Error(text, secrets) {
+  const parts = [xmlField(text, 'Code'), xmlField(text, 'Message')].filter(Boolean);
+  return parts.length ? parts.map((p) => redact(p, secrets).slice(0, MAX_ERROR_CHARS)).join(': ') : summarizeError(text, secrets);
+}
+
+const PUBLISHABLE_KEY_NOTE =
+  'The S3 secret is a publishable key (sb_publishable_...). Storage S3 may accept only the legacy anon key as the secret access key.';
+
+// ListBuckets with the target ref as access key id, the target key as secret and the token as session token.
+async function probeS3(deps, { ref, url, key, token, region, isControl }) {
+  const started = Date.now();
+  const secrets = [token, key];
+  const extra = { region: region.name, region_source: region.source };
+  try {
+    const target = `${url}${S3_PATH}`;
+    const { headers } = signRequest({
+      url: target,
+      region: region.name,
+      service: 's3',
+      accessKeyId: ref,
+      secretAccessKey: key,
+      sessionToken: token,
+      headers: { 'x-amz-content-sha256': EMPTY_PAYLOAD_SHA256 },
+      now: deps.now?.(),
+    });
+    const res = await deps.fetchImpl(target, {
+      method: 'GET',
+      headers,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    const header = res.headers.get(GATEWAY_HEADER);
+    const result = { status: res.status, gateway_version: normalizeGatewayVersion(header), gateway_header: header, ...extra };
+    if (res.ok) await res.body?.cancel?.();
+    else {
+      const error = summarizeS3Error(await res.text(), secrets);
+      const credentialError = S3_CREDENTIAL_CODES.some((code) => error.startsWith(code));
+      result.error = isControl && credentialError && key.startsWith('sb_publishable_') ? `${error} ${PUBLISHABLE_KEY_NOTE}` : error;
+    }
+    return { ...result, ms: Date.now() - started };
+  } catch (err) {
+    return { status: null, gateway_version: 'unknown', gateway_header: null, ...extra, error: cut(err.message, secrets), ms: Date.now() - started };
+  }
+}
+
+const REALTIME_OUTCOMES = ['SUBSCRIBED', 'CHANNEL_ERROR', 'TIMED_OUT'];
+
+// Joins a private channel with the target key as apikey and the token as the Realtime access token.
+async function probeRealtime(deps, { url, key, token }) {
+  const started = Date.now();
+  const secrets = [token, key];
+  const timeoutMs = deps.realtimeTimeoutMs ?? REALTIME_TIMEOUT_MS;
+  let client;
+  try {
+    client = deps.createClientImpl(url, key, {
+      auth: { persistSession: false, autoRefreshToken: false },
+      realtime: { transport: globalThis.WebSocket },
+    });
+    await client.realtime.setAuth(token);
+    const outcome = await new Promise((resolve) => {
+      const channel = client.channel(`vercel-oidc-xtenant-${randomBytes(6).toString('hex')}`, { config: { private: true } });
+      const timer = setTimeout(() => resolve({ status: 'TIMED_OUT', error: `no answer within ${timeoutMs} ms` }), timeoutMs);
+      channel.subscribe((status, err) => {
+        if (!REALTIME_OUTCOMES.includes(status)) return;
+        clearTimeout(timer);
+        resolve({ status, ...(err?.message && { error: cut(err.message, secrets) }) });
+      });
+    });
+    return { ...outcome, gateway_version: 'unknown', ms: Date.now() - started };
+  } catch (err) {
+    return { status: null, gateway_version: 'unknown', error: cut(err.message, secrets), ms: Date.now() - started };
+  } finally {
+    try {
+      await client?.removeAllChannels?.();
+      client?.realtime?.disconnect?.();
+    } catch {}
+  }
+}
+
+function probeService(deps, tenant, service) {
+  return service.probe
+    ? service.probe(deps, tenant)
+    : probe(deps.fetchImpl, tenant.url, tenant.key, tenant.token, service);
+}
+
+async function probeAll(deps, tenant) {
+  const results = await Promise.all(SERVICES.map((s) => probeService(deps, tenant, s)));
   return Object.fromEntries(SERVICES.map((s, i) => [s.id, results[i]]));
 }
 
@@ -200,7 +312,27 @@ async function jitProbes(jit, ref) {
   return { jit_mgmt: cleanMgmt(mgmt, secrets), jit_pooler: pooler };
 }
 
-async function runCrossTenant({ spec, ownUrl, ownKey, token, jit, fetchImpl = (...args) => fetch(...args) }) {
+const defaultCreateClient = (...args) => require('@supabase/supabase-js').createClient(...args);
+
+// The S3 signature needs the region of the project. The pooler host names it (aws-<n>-<region>.pooler...).
+// A target region is known only from a cached or hinted pooler host, because the pooler search runs at the same time.
+function pickRegion(candidates) {
+  const found = candidates.map(([source, host]) => ({ name: poolerRegion(host), source })).find((c) => c.name);
+  return found ?? { name: DEFAULT_S3_REGION, source: 'default' };
+}
+
+async function runCrossTenant({
+  spec,
+  ownUrl,
+  ownKey,
+  token,
+  jit,
+  ownPoolerHost = jit?.poolerHost,
+  fetchImpl = (...args) => fetch(...args),
+  createClientImpl = defaultCreateClient,
+  realtimeTimeoutMs,
+  now,
+}) {
   if (!spec?.trim()) return { skipped: `CROSS_TENANT_TARGETS is not set. ${TARGETS_HINT}` };
   if (!token) return { skipped: 'No resource token was minted.' };
   try {
@@ -210,11 +342,21 @@ async function runCrossTenant({ spec, ownUrl, ownKey, token, jit, fetchImpl = (.
   }
   const { own, targets, errors } = parseTargets(spec, ownUrl);
   const noKey = { status: null, gateway_version: 'unknown', error: 'No publishable or anon key is set for this tenant.' };
+  const deps = { fetchImpl, createClientImpl, realtimeTimeoutMs, now };
+  const hostCache = jit?.poolerCache ?? poolerHostCache;
+  const ownRegion = pickRegion([['own_pooler_host', ownPoolerHost]]);
   const [control, ...probes] = await Promise.all([
-    ownKey ? probeAll(fetchImpl, own.url, ownKey, token) : Object.fromEntries(SERVICES.map((s) => [s.id, noKey])),
+    ownKey
+      ? probeAll(deps, { ref: own.ref, url: own.url, key: ownKey, token, region: ownRegion, isControl: true })
+      : Object.fromEntries(SERVICES.map((s) => [s.id, noKey])),
     ...targets.map(async (t) => {
+      const region = pickRegion([
+        ['target_pooler_cache', hostCache.get(t.ref)],
+        ['target_pooler_hint', jit?.poolerHints?.[t.ref]],
+        ['own_pooler_host', ownPoolerHost],
+      ]);
       const [targetProbes, health, jitResults] = await Promise.all([
-        probeAll(fetchImpl, t.url, t.key, token),
+        probeAll(deps, { ref: t.ref, url: t.url, key: t.key, token, region }),
         probeHealth(fetchImpl, t.url, t.key),
         jitProbes(jit, t.ref),
       ]);
@@ -233,7 +375,34 @@ const GATEWAY_NOT_ISSUED_MESSAGE = 'Vercel OIDC token not issued for this projec
 
 const is2xx = (status) => status >= 200 && status < 300;
 
+const healthFailure = (health) => ({
+  result: 'inconclusive',
+  reason: `the target ref or key is not valid in this environment (GET ${HEALTH_PATH} returned ${health?.status ?? health?.error ?? 'no response'})`,
+});
+
+const controlFailure = (control, hint) => {
+  const detail = control?.error;
+  return {
+    result: 'inconclusive',
+    reason: `control on this tenant returned ${control?.status ?? control?.error ?? 'no response'}; this tenant does not accept the token for this service either, so a rejection by the target proves nothing${detail ? ` (${detail})` : ''}${hint ? `. ${hint}` : ''}`,
+  };
+};
+
+const REALTIME_RLS_HINT = 'A private channel needs a policy on realtime.messages that allows this token';
+
+function classifyRealtime(service, control, target, health) {
+  const s = target?.status ?? null;
+  if (s === 'SUBSCRIBED') return { result: 'accepted' };
+  if (s === null) return { result: 'inconclusive', reason: `network error: ${target?.error ?? 'no response'}` };
+  if (s === 'TIMED_OUT') return { result: 'inconclusive', reason: `no answer from the target (${target.error ?? 'timed out'})` };
+  if (!is2xx(health?.status)) return healthFailure(health);
+  if (control?.status !== 'SUBSCRIBED') return controlFailure(control, REALTIME_RLS_HINT);
+  if (s === 'CHANNEL_ERROR') return { result: 'rejected' };
+  return { result: 'inconclusive', reason: `unexpected status ${s}` };
+}
+
 function classify(service, control, target, health) {
+  if (service.classify) return service.classify(service, control, target, health);
   const s = target?.status ?? null;
   if (is2xx(s)) return { result: 'accepted' };
   if (service.id === 'rest' && s === 404 && /PGRST205/.test(target?.error ?? '')) {
@@ -244,17 +413,12 @@ function classify(service, control, target, health) {
   if (s === 401 && target?.error?.includes(GATEWAY_NOT_ISSUED_MESSAGE)) {
     return { result: 'rejected', reason: `api-gateway rejected the token: ${GATEWAY_NOT_ISSUED_MESSAGE}` };
   }
-  if (!is2xx(health?.status)) {
+  if (!is2xx(health?.status)) return healthFailure(health);
+  if (!is2xx(control?.status)) return controlFailure(control);
+  if (service.id === 'storage_s3' && S3_CREDENTIAL_CODES.some((code) => target?.error?.startsWith(code))) {
     return {
       result: 'inconclusive',
-      reason: `the target ref or key is not valid in this environment (GET ${HEALTH_PATH} returned ${health?.status ?? health?.error ?? 'no response'})`,
-    };
-  }
-  if (!is2xx(control?.status)) {
-    const detail = control?.error;
-    return {
-      result: 'inconclusive',
-      reason: `control on this tenant returned ${control?.status ?? control?.error ?? 'no response'}; this tenant does not accept the token for this service either, so a rejection by the target proves nothing${detail ? ` (${detail})` : ''}`,
+      reason: 'the target rejected the S3 access key or signature before it checked the token, so this proves nothing about the token',
     };
   }
   if (service.isRejection(s)) return { result: 'rejected' };
@@ -270,8 +434,10 @@ function evaluateService(data, service) {
       gateway_version: p.gateway_version,
       control_status: control?.status ?? null,
       ...(control?.error && { control_error: control.error }),
+      ...(control?.region && { control_region: control.region, control_region_source: control.region_source }),
       status: p.status,
       ...(p.error && { error: p.error }),
+      ...(p.region && { region: p.region, region_source: p.region_source }),
       ...classify(service, control, p, t.health),
     };
   });
@@ -386,7 +552,7 @@ function evaluateJitProbe(data, jit, probe) {
 function gatewayCoverage(data) {
   const perTarget = data.targets.map((t) => ({
     target: t.ref,
-    gateway_versions: [...new Set(Object.values(t.probes).map((p) => p.gateway_version))].sort(),
+    gateway_versions: [...new Set(SERVICES.filter((s) => !s.noGateway).map((s) => t.probes[s.id].gateway_version))].sort(),
   }));
   const seen = [...new Set(perTarget.flatMap((t) => t.gateway_versions))].sort();
   return { perTarget, seen };

@@ -18,6 +18,10 @@ const CONCURRENCY = 4;
 // Target ref -> pooler host that gave an answer. Lives as long as the warm function instance.
 const poolerHostCache = new Map();
 
+const POOLER_REGION_RE = /^aws-\d+-([a-z]{2}-[a-z]+-\d+)\.pooler\.[a-z0-9][a-z0-9.-]*$/;
+
+const poolerRegion = (host) => POOLER_REGION_RE.exec(host ?? '')?.[1] ?? null;
+
 function candidateHosts(ownHost) {
   const match = POOLER_HOST_RE.exec(ownHost ?? '');
   if (!match) return ownHost ? [ownHost] : [];
@@ -103,6 +107,7 @@ async function findTargetPooler({
 
 module.exports = {
   POOLER_REGIONS,
+  poolerRegion,
   candidateHosts,
   parsePoolerHints,
   isAuthRejection,

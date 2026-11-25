@@ -170,7 +170,7 @@ function crossTenantServiceCheck(service) {
   return {
     id: `cross_tenant_${service.id}`,
     group: 'cross_tenant',
-    description: `${service.label} on other tenants rejects this tenant's default-role resource token (${service.method} ${service.path})`,
+    description: `${service.label} on other tenants rejects this tenant's default-role resource token (${service.request ?? `${service.method} ${service.path}`})`,
     run: (c) => {
       const s = needCrossTenantTargets(c);
       if (s) return s;

@@ -280,6 +280,7 @@ function runCrossTenantProbes(req, server, jit) {
     ownUrl: SUPABASE_URL,
     ownKey: server.ctx?.apikey,
     token: server.ctx?.resourceToken,
+    ownPoolerHost: process.env.POSTGRES_POOLER_HOST,
     jit: jitToken
       ? {
           token: jitToken,

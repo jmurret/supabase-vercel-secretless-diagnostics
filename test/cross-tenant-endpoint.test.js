@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const Module = require('node:module');
 const crossTenant = require('../cross-tenant');
 const { runChecks } = require('../checks');
-const { oidcData } = require('./helpers');
+const { oidcData, fakeRealtime } = require('./helpers');
 
 const noFetch = () => {
   throw new Error('unexpected fetch');
@@ -46,6 +46,7 @@ test('control error detail does not repeat the status', async () => {
     ownKey: 'sb_publishable_own',
     token: 'header.payload.signature',
     fetchImpl: stub,
+    createClientImpl: fakeRealtime().createClientImpl,
   });
   const row = crossTenant.evaluateService(ct, crossTenant.SERVICES[0]).rows[0];
   assert.equal(row.control_error, '403 bad_jwt: rejected');

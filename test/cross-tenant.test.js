@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { SERVICES: PROBES, normalizeGatewayVersion, parseTargets, runCrossTenant, evaluateService } = require('../cross-tenant');
-const { REF, oidcData, check } = require('./helpers');
+const { REF, oidcData, check, fakeRealtime } = require('./helpers');
 
 const OWN_URL = `https://${REF}.supabase.co`;
 const OTHER = 'zyxwvutsrqponmlkjihg';
@@ -39,7 +39,7 @@ async function run(opts) {
   const { respond, health, ownKey = 'sb_publishable_own', token = TOKEN } = opts;
   const spec = 'spec' in opts ? opts.spec : `${OTHER}=sb_publishable_other`;
   const { fetchImpl, calls } = stubFetch(respond, health);
-  const ct = await runCrossTenant({ spec, ownUrl: OWN_URL, ownKey, token, fetchImpl });
+  const ct = await runCrossTenant({ spec, ownUrl: OWN_URL, ownKey, token, fetchImpl, createClientImpl: fakeRealtime().createClientImpl });
   return { ct, calls, data: oidcData({ cross_tenant: ct }) };
 }
 
@@ -114,7 +114,7 @@ test('sends the target key as apikey and the token as Bearer', async () => {
   const rt = target.find((c) => serviceOf(c.url) === 'realtime');
   assert.equal(rt.init.method, 'POST');
   assert.deepEqual(JSON.parse(rt.init.body).messages[0].private, true);
-  const own = calls.filter((c) => refOf(c.url) === REF);
+  const own = calls.filter((c) => refOf(c.url) === REF && serviceOf(c.url));
   assert.ok(own.every((c) => c.init.headers.apikey === 'sb_publishable_own'));
 });
 

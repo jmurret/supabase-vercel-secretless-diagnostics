@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { runCrossTenant } = require('../cross-tenant');
-const { REF, oidcData, check } = require('./helpers');
+const { REF, oidcData, check, fakeRealtime } = require('./helpers');
 
 const OWN_URL = `https://${REF}.supabase.co`;
 const OTHER = 'zyxwvutsrqponmlkjihg';
@@ -44,6 +44,7 @@ function run({ mgmt = () => ({ status: 403, error: 'forbidden' }), pooler = () =
     token: TOKEN,
     jit: jitArg,
     fetchImpl,
+    createClientImpl: fakeRealtime().createClientImpl,
   }).then((ct) => ({ ct, calls, data: oidcData({ cross_tenant: ct, jit: control }) }));
 }
 
@@ -157,7 +158,7 @@ test('both checks skip without a JIT token', async () => {
     assert.equal(r.status, 'skip', id);
     assert.equal(r.detail, 'JIT token mint failed: mint failed: 403');
   }
-  const ct = await runCrossTenant({ spec: `${OTHER}=k`, ownUrl: OWN_URL, token: TOKEN, fetchImpl: stubFetch(200) });
+  const ct = await runCrossTenant({ spec: `${OTHER}=k`, ownUrl: OWN_URL, token: TOKEN, fetchImpl: stubFetch(200), createClientImpl: fakeRealtime().createClientImpl });
   for (const id of IDS) {
     assert.equal((await check(id, { data: oidcData({ cross_tenant: ct, jit: CONTROL_OK }) })).detail, 'No JIT resource token was minted.', id);
   }
