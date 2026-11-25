@@ -1,6 +1,9 @@
 const crypto = require('crypto');
 const { RESYNC_HINT } = require('./pooler');
-const { SERVICES: CROSS_TENANT_SERVICES, evaluateService, gatewayCoverage } = require('./cross-tenant');
+const {
+  SERVICES: CROSS_TENANT_SERVICES, JIT_PROBES, evaluateService, describeVariants, evaluateJitProbe, gatewayCoverage,
+} = require('./cross-tenant');
+const { FORWARD_HEADER, VARIANTS, notForwardedReason, isForwarded, worstStatus } = require('./gateway-variants');
 
 // Expectations from "Vercel Marketplace OIDC" (Vercel OIDC secretless spec, Nov 18).
 const SPEC = 'Vercel Marketplace OIDC (spec updated Nov 18)';
@@ -129,6 +132,8 @@ function buildContext(data, ctx, env, nowMs) {
     controls: sc.controls ?? null,
     jit: data.jit ?? null,
     crossTenant: data.cross_tenant ?? null,
+    crossTenantS3: data.cross_tenant_s3 ?? null,
+    gatewayV2: data.gateway_v2 ?? null,
   };
 }
 
@@ -153,44 +158,82 @@ const needJitToken = (c) => {
 };
 
 const JIT_HINT = 'Check that JIT access is enabled: run `pnpm run enable-jit`.';
-const CTRL_2151_HINT = 'Known issue CTRL-2151: the pooler needs `--jit=true`.';
+const CTRL_2151_HINT = 'Known issue CTRL-2151: the pooler needs `--jit=true`. Existing clients send this option, so this is a warning, not a failure.';
 const JIT_ROLE_MISMATCH = 'Token role does not match requested role';
 const JIT_ROLE_HINT = `The token role must equal the requested JIT role. Mint the token with ?role=${JIT_ROLE}.`;
 const jitApiHint = (r) => (r.status === 403 && r.error?.includes(JIT_ROLE_MISMATCH) ? JIT_ROLE_HINT : JIT_HINT);
-const needCrossTenant = (c) => {
-  const ct = c.crossTenant;
+const needCrossTenant = (c, ct = c.crossTenant) => {
   if (!ct) return skip('Cross-tenant probes were not run.');
   if (ct.skipped) return skip(ct.skipped);
   return null;
 };
-const needCrossTenantTargets = (c) =>
-  needCrossTenant(c) || (c.crossTenant.targets.length ? null : skip('No valid cross-tenant targets; see cross_tenant_targets.'));
+const needCrossTenantTargets = (c, ct = c.crossTenant) =>
+  needCrossTenant(c, ct) || (ct.targets.length ? null : skip('No valid cross-tenant targets; see cross_tenant_targets.'));
 
 function crossTenantServiceCheck(service) {
+  const onGateways = service.noGateway ? '' : ' on api-gateway v1 and v2';
   return {
     id: `cross_tenant_${service.id}`,
     group: 'cross_tenant',
-    description: `${service.label} on other tenants rejects this tenant's default-role resource token (${service.method} ${service.path})`,
+    description: `${service.label} on other tenants rejects this tenant's default-role resource token${onGateways} (${service.request ?? `${service.method} ${service.path}`})`,
     run: (c) => {
-      const s = needCrossTenantTargets(c);
+      const ct = service.regional ? c.crossTenantS3 : c.crossTenant;
+      const s = needCrossTenantTargets(c, ct);
       if (s) return s;
-      const { rows, accepted, inconclusive } = evaluateService(c.crossTenant, service);
-      const expected = `${service.expected} from every target`;
-      const ownRef = c.crossTenant.own.ref;
+      const { rows, accepted, inconclusive } = evaluateService(ct, service);
+      const expected = `${service.expected} from every target${onGateways}`;
+      const ownRef = ct.own.ref;
+      if (service.noGateway) {
+        if (accepted.length) {
+          return fail(expected, rows, accepted
+            .map((r) => `regression: ${service.label} on ${r.target} (gateway ${r.gateway_version}) accepted tenant ${ownRef}'s token`)
+            .join('; '));
+        }
+        if (inconclusive.length) {
+          return warn(expected, rows, `Inconclusive: ${inconclusive.map((r) => `${r.target}: ${r.reason}`).join('; ')}`);
+        }
+        return pass(expected, rows);
+      }
       if (accepted.length) {
         return fail(expected, rows, accepted
-          .map((r) => `regression: ${service.label} on ${r.target} (gateway ${r.gateway_version}) accepted tenant ${ownRef}'s token`)
+          .map((r) => `regression: ${service.label} on ${r.target} accepted tenant ${ownRef}'s token (${describeVariants(r)})`)
           .join('; '));
       }
-      if (inconclusive.length) {
-        return warn(expected, rows, `Inconclusive: ${inconclusive.map((r) => `${r.target}: ${r.reason}`).join('; ')}`);
-      }
-      return pass(expected, rows);
+      const outcomes = (list) => list.map((r) => `${r.target}: ${describeVariants(r)}`).join('; ');
+      if (inconclusive.length) return warn(expected, rows, `Inconclusive: ${outcomes(inconclusive)}`);
+      return pass(expected, rows, outcomes(rows));
     },
   };
 }
 
-const NO_ROUTE_CODES = ['ENETUNREACH', 'EHOSTUNREACH', 'EADDRNOTAVAIL', 'ETIMEDOUT'];
+function crossTenantJitCheck(probe) {
+  return {
+    id: `cross_tenant_${probe.id}`,
+    group: 'cross_tenant',
+    description: probe.description,
+    run: (c) => {
+      const s = needCrossTenantTargets(c);
+      if (s) return s;
+      const evaluated = evaluateJitProbe(c.crossTenant, c.jit, probe);
+      if (evaluated.skipped) return skip(evaluated.skipped);
+      const { rows, accepted, inconclusive } = evaluated;
+      const ownRef = c.crossTenant.own.ref;
+      const note = (r) => (r.note ? ` (${r.note})` : '');
+      if (accepted.length) {
+        return fail(probe.expected, rows, accepted
+          .map((r) => `regression: ${probe.label} on ${r.target} accepted tenant ${ownRef}'s JIT token${note(r)}`)
+          .join('; '));
+      }
+      if (inconclusive.length) {
+        return warn(probe.expected, rows, `Inconclusive: ${inconclusive.map((r) => `${r.target}: ${r.reason}${note(r)}`).join('; ')}`);
+      }
+      const notes = rows.filter((r) => r.note).map((r) => `${r.target}: ${r.note}`).join('; ');
+      return pass(probe.expected, rows, notes || undefined);
+    },
+  };
+}
+
+const NO_ROUTE_CODES =['ENETUNREACH', 'EHOSTUNREACH', 'EADDRNOTAVAIL', 'ETIMEDOUT'];
 const isAuthFailure = (r) => r.code === '28P01' || /password authentication failed/.test(r.error);
 const isNoRoute = (r) => NO_ROUTE_CODES.includes(r.code) || r.error === 'timeout expired';
 
@@ -565,8 +608,22 @@ const CHECKS = [
     },
   },
   {
+    id: 'gateway_v2_forwarding',
+    group: 'path',
+    description: `Requests with the ${FORWARD_HEADER} header reach api-gateway v2 (from the sb-gateway-version response header)`,
+    run: (c) => {
+      const versions = c.gatewayV2?.gateway_versions;
+      if (!versions || !Object.keys(versions).length) return skip('No api-gateway v2 requests were sent.');
+      const missed = Object.entries(versions).filter(([, version]) => !isForwarded('v2', version));
+      if (!missed.length) return pass('v2', versions);
+      return warn('v2', versions,
+        `Not forwarded to api-gateway v2: ${missed.map(([name, version]) => `${name} (${version === 'loop' ? 'forwarding loop between v1 and v2' : `answered by ${version}`})`).join(', ')}. The v2 results of the database checks are inconclusive. Staging can have no forwarding configured.`);
+    },
+  },
+  {
     id: 'db_accepted',
     group: 'database',
+    gateway: ['database_identity'],
     description: 'Supabase accepted the resource token',
     run: (c) => {
       const s = needDb(c);
@@ -584,6 +641,7 @@ const CHECKS = [
   {
     id: 'db_role',
     group: 'database',
+    gateway: ['database_identity'],
     description: `Database request runs as "${EXPECTED_ROLE}"`,
     run: (c) => {
       const s = needDb(c);
@@ -597,6 +655,7 @@ const CHECKS = [
   {
     id: 'db_claims_match',
     group: 'database',
+    gateway: ['database_identity'],
     description: 'Claims seen by the database match the minted token (iss, sub, aud, role)',
     run: (c) => {
       const s = needDb(c);
@@ -613,6 +672,7 @@ const CHECKS = [
   {
     id: 'db_rls_bypass',
     group: 'database',
+    gateway: ['database_identity'],
     description: `Database role ${EXPECTED_BYPASS_RLS ? 'bypasses' : 'does not bypass'} RLS, as expected for "${EXPECTED_ROLE}"`,
     run: (c) => {
       const s = needDb(c);
@@ -626,6 +686,7 @@ const CHECKS = [
   {
     id: 'db_table_access',
     group: 'database',
+    gateway: ['access'],
     description: 'Probe tables (public.countries) can be read with the resource token',
     run: (c) => {
       const s = needResource(c);
@@ -642,6 +703,7 @@ const CHECKS = [
   {
     id: 'db_anon_control',
     group: 'database',
+    gateway: ['apikey_only', 'database_identity'],
     description: 'Control: without the resource token (apikey only) the request runs as anon',
     run: (c) => {
       const s = needDb(c);
@@ -661,6 +723,7 @@ const CHECKS = [
   {
     id: 'db_tampered_rejected',
     group: 'database',
+    gateway: ['tampered_token'],
     description: 'Control: Supabase rejects the resource token with a tampered signature (401 PGRST301)',
     run: (c) => {
       const s = needResource(c);
@@ -751,7 +814,7 @@ const CHECKS = [
       if (r.skipped) return skip(r.skipped);
       if (r.error) {
         const actual = { endpoint: r.endpoint, error: r.error };
-        return fail(expected, actual, isAuthFailure(r) ? CTRL_2151_HINT : undefined);
+        return isAuthFailure(r) ? warn(expected, actual, CTRL_2151_HINT) : fail(expected, actual);
       }
       return r.current_user === JIT_ROLE
         ? pass(expected, { endpoint: r.endpoint, current_user: r.current_user, ms: r.ms }, 'CTRL-2151 may be fixed.')
@@ -782,7 +845,7 @@ const CHECKS = [
   {
     id: 'cross_tenant_targets',
     group: 'cross_tenant',
-    description: 'CROSS_TENANT_TARGETS lists other tenants as <project ref or https:// URL>=<publishable or anon key>',
+    description: 'CROSS_TENANT_TARGETS lists other tenants as <project ref or https:// URL>=<publishable or anon key>[:<legacy anon key>]',
     run: (c) => {
       const s = needCrossTenant(c);
       if (s) return s;
@@ -793,34 +856,73 @@ const CHECKS = [
     },
   },
   ...CROSS_TENANT_SERVICES.map(crossTenantServiceCheck),
+  ...JIT_PROBES.map(crossTenantJitCheck),
   {
     id: 'cross_tenant_gateway_coverage',
     group: 'cross_tenant',
-    description: 'Cross-tenant targets cover api-gateway v1 and v2 (from the sb-gateway-version response header)',
+    description: `Cross-tenant requests reach api-gateway v1 without the ${FORWARD_HEADER} header and api-gateway v2 with it (from the sb-gateway-version response header)`,
     run: (c) => {
       const s = needCrossTenantTargets(c);
       if (s) return s;
-      const { perTarget, seen } = gatewayCoverage(c.crossTenant);
-      const expected = ['v1', 'v2'];
-      const missing = expected.filter((v) => !seen.includes(v));
-      const actual = { seen, targets: perTarget };
-      return missing.length
-        ? warn(expected, actual, `No target answered with gateway ${missing.join(' or ')}. Add a target on that gateway.`)
-        : pass(expected, actual);
+      const targets = gatewayCoverage(c.crossTenant);
+      const expected = 'for every target: v1 requests answered by api-gateway v1, v2 requests answered by api-gateway v2';
+      const missed = targets.filter((t) => t.missing.length);
+      if (!missed.length) return pass(expected, targets);
+      return warn(expected, targets, missed
+        .map((t) => `${t.target}: ${t.missing.map((v) => `${v} requests were answered by ${t[v].join(', ') || 'no gateway'}`).join(', ')}`)
+        .join('; '));
     },
   },
 ];
 
-async function runChecks(data, ctx, { env = process.env, now = Date.now, fetchImpl = fetch } = {}) {
+async function runOne(check, c, deps) {
+  try {
+    return await check.run(c, deps);
+  } catch (err) {
+    return fail(null, null, `Check errored: ${err.message}`);
+  }
+}
+
+// The v2 context replaces the api-gateway results with the results of the requests sent to api-gateway v2.
+const v2Context = (c) => ({
+  ...c,
+  sc: { ...c.sc, access: c.gatewayV2.access },
+  db: c.gatewayV2.database_identity ?? null,
+  controls: c.gatewayV2.controls ?? null,
+});
+
+const describeOutcome = (variant, r) => `${variant} ${r.status}${r.detail ? ` (${r.detail})` : ''}`;
+
+// A check with `gateway` (the names of its requests in gateway_v2.gateway_versions) runs on the v1 results and on
+// the v2 results. A v2 result is inconclusive when api-gateway v2 did not answer one of its requests. The status
+// is the worst of the two: fail, then warn, then pass, then skip.
+async function runOnGateways(check, c, deps) {
+  const outcomes = { v1: await runOne(check, c, deps) };
+  outcomes.v2 = c.gatewayV2 ? await runOne(check, v2Context(c), deps) : skip('api-gateway v2 requests were not run.');
+  if (outcomes.v2.status !== 'skip') {
+    const versions = check.gateway.map((name) => c.gatewayV2.gateway_versions?.[name] ?? 'unknown');
+    const missed = versions.find((version) => !isForwarded('v2', version));
+    if (missed) outcomes.v2 = warn(outcomes.v2.expected, outcomes.v2.actual, notForwardedReason(missed));
+  }
+  const statuses = VARIANTS.map((v) => outcomes[v].status);
+  if (statuses.every((s) => s === 'skip')) return { ...outcomes.v1, variants: outcomes };
+  return {
+    status: worstStatus(statuses),
+    expected: outcomes.v1.expected ?? outcomes.v2.expected,
+    actual: Object.fromEntries(VARIANTS.map((v) => [v, outcomes[v].actual])),
+    detail: VARIANTS.map((v) => describeOutcome(v, outcomes[v])).join(', '),
+    variants: outcomes,
+  };
+}
+
+// include and exclude are lists of group names and check ids. The summary covers only the checks that ran.
+async function runChecks(data, ctx, { env = process.env, now = Date.now, fetchImpl = fetch, include, exclude } = {}) {
   const c = buildContext(data, ctx, env, now());
   const results = [];
-  for (const check of CHECKS) {
-    let outcome;
-    try {
-      outcome = await check.run(c, { fetchImpl });
-    } catch (err) {
-      outcome = fail(null, null, `Check errored: ${err.message}`);
-    }
+  const matches = (list, check) => list.includes(check.group) || list.includes(check.id);
+  const selected = CHECKS.filter((check) => (!include || matches(include, check)) && !(exclude && matches(exclude, check)));
+  for (const check of selected) {
+    const outcome = check.gateway ? await runOnGateways(check, c, { fetchImpl }) : await runOne(check, c, { fetchImpl });
     results.push({ id: check.id, group: check.group, description: check.description, ...outcome });
   }
   const count = (st) => results.filter((r) => r.status === st).length;

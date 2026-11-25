@@ -23,4 +23,41 @@ async function check(id, { data = oidcData(), ctx = {}, env = {} } = {}) {
   return r;
 }
 
-module.exports = { REF, oidcData, check };
+const REALTIME_DEFAULT = (url) =>
+  new URL(url).hostname.startsWith(REF) ? { status: 'SUBSCRIBED' } : { status: 'CHANNEL_ERROR', error: 'Unauthorized' };
+
+// answer(url, key, token) -> { status, error? } | Error | 'hang'. `clients` records each client it made.
+function fakeRealtime(answer = REALTIME_DEFAULT) {
+  const clients = [];
+  const createClientImpl = (url, key, options) => {
+    const client = { url, key, options, token: null, channels: [], removed: 0, disconnected: 0 };
+    clients.push(client);
+    return {
+      realtime: {
+        setAuth: async (token) => {
+          client.token = token;
+        },
+        disconnect: () => {
+          client.disconnected += 1;
+        },
+      },
+      channel: (name, config) => {
+        client.channels.push({ name, config });
+        return {
+          subscribe: (callback) => {
+            const r = answer(url, key, client.token);
+            if (r === 'hang') return;
+            if (r instanceof Error) throw r;
+            setImmediate(() => callback(r.status, r.error ? new Error(r.error) : undefined));
+          },
+        };
+      },
+      removeAllChannels: async () => {
+        client.removed += 1;
+      },
+    };
+  };
+  return { createClientImpl, clients };
+}
+
+module.exports = { REF, oidcData, check, fakeRealtime };
