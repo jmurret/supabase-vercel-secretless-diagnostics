@@ -1,6 +1,9 @@
 const crypto = require('crypto');
 const { RESYNC_HINT } = require('./pooler');
-const { SERVICES: CROSS_TENANT_SERVICES, JIT_PROBES, evaluateService, evaluateJitProbe, gatewayCoverage } = require('./cross-tenant');
+const {
+  SERVICES: CROSS_TENANT_SERVICES, JIT_PROBES, evaluateService, describeVariants, evaluateJitProbe, gatewayCoverage,
+} = require('./cross-tenant');
+const { FORWARD_HEADER } = require('./gateway-variants');
 
 // Expectations from "Vercel Marketplace OIDC" (Vercel OIDC secretless spec, Nov 18).
 const SPEC = 'Vercel Marketplace OIDC (spec updated Nov 18)';
@@ -167,25 +170,36 @@ const needCrossTenantTargets = (c) =>
   needCrossTenant(c) || (c.crossTenant.targets.length ? null : skip('No valid cross-tenant targets; see cross_tenant_targets.'));
 
 function crossTenantServiceCheck(service) {
+  const onGateways = service.noGateway ? '' : ' on api-gateway v1 and v2';
   return {
     id: `cross_tenant_${service.id}`,
     group: 'cross_tenant',
-    description: `${service.label} on other tenants rejects this tenant's default-role resource token (${service.request ?? `${service.method} ${service.path}`})`,
+    description: `${service.label} on other tenants rejects this tenant's default-role resource token${onGateways} (${service.request ?? `${service.method} ${service.path}`})`,
     run: (c) => {
       const s = needCrossTenantTargets(c);
       if (s) return s;
       const { rows, accepted, inconclusive } = evaluateService(c.crossTenant, service);
-      const expected = `${service.expected} from every target`;
+      const expected = `${service.expected} from every target${onGateways}`;
       const ownRef = c.crossTenant.own.ref;
+      if (service.noGateway) {
+        if (accepted.length) {
+          return fail(expected, rows, accepted
+            .map((r) => `regression: ${service.label} on ${r.target} (gateway ${r.gateway_version}) accepted tenant ${ownRef}'s token`)
+            .join('; '));
+        }
+        if (inconclusive.length) {
+          return warn(expected, rows, `Inconclusive: ${inconclusive.map((r) => `${r.target}: ${r.reason}`).join('; ')}`);
+        }
+        return pass(expected, rows);
+      }
       if (accepted.length) {
         return fail(expected, rows, accepted
-          .map((r) => `regression: ${service.label} on ${r.target} (gateway ${r.gateway_version}) accepted tenant ${ownRef}'s token`)
+          .map((r) => `regression: ${service.label} on ${r.target} accepted tenant ${ownRef}'s token (${describeVariants(r)})`)
           .join('; '));
       }
-      if (inconclusive.length) {
-        return warn(expected, rows, `Inconclusive: ${inconclusive.map((r) => `${r.target}: ${r.reason}`).join('; ')}`);
-      }
-      return pass(expected, rows);
+      const outcomes = (list) => list.map((r) => `${r.target}: ${describeVariants(r)}`).join('; ');
+      if (inconclusive.length) return warn(expected, rows, `Inconclusive: ${outcomes(inconclusive)}`);
+      return pass(expected, rows, outcomes(rows));
     },
   };
 }
@@ -824,20 +838,17 @@ const CHECKS = [
   {
     id: 'cross_tenant_gateway_coverage',
     group: 'cross_tenant',
-    description: 'Cross-tenant targets cover api-gateway v1 and v2 (from the sb-gateway-version response header)',
+    description: `Cross-tenant requests reach api-gateway v1 without the ${FORWARD_HEADER} header and api-gateway v2 with it (from the sb-gateway-version response header)`,
     run: (c) => {
       const s = needCrossTenantTargets(c);
       if (s) return s;
-      const { perTarget, seen } = gatewayCoverage(c.crossTenant);
-      const expected = ['v1', 'v2'];
-      const missing = expected.filter((v) => !seen.includes(v));
-      const actual = { seen, targets: perTarget };
-      if (!missing.length) return pass(expected, actual);
-      const v1Detail = 'No target answered with gateway v1. Add a target on that gateway.';
-      const detail = missing.includes('v2')
-        ? `No target is served by api-gateway v2. The v2 gateway does not serve any projects yet, so only v1 can be checked now.${missing.includes('v1') ? ` ${v1Detail}` : ''}`
-        : v1Detail;
-      return warn(expected, actual, detail);
+      const targets = gatewayCoverage(c.crossTenant);
+      const expected = 'for every target: v1 requests answered by api-gateway v1, v2 requests answered by api-gateway v2';
+      const missed = targets.filter((t) => t.missing.length);
+      if (!missed.length) return pass(expected, targets);
+      return warn(expected, targets, missed
+        .map((t) => `${t.target}: ${t.missing.map((v) => `${v} requests were answered by ${t[v].join(', ') || 'no gateway'}`).join(', ')}`)
+        .join('; '));
     },
   },
 ];

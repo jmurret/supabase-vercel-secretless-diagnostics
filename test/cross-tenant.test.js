@@ -18,22 +18,27 @@ const PATHS = {
 const serviceOf = (url) => SERVICES.find((s) => new URL(url).pathname === PATHS[s]);
 const refOf = (url) => new URL(url).hostname.split('.')[0];
 
-// respond(ref, service) -> { status, version } | Error
+const variantOf = (init) => (init?.headers?.['sb-forward-traffic'] ? 'v2' : 'v1');
+
+// respond(ref, service, variant) -> { status, version?, body? } | Error. Without a version key, the request is
+// answered by the gateway of its variant (v1 for v1, v2 for v2). version: undefined sends no header.
 function stubFetch(respond, health = () => ({ status: 200 })) {
   const calls = [];
   const fetchImpl = async (url, init) => {
     calls.push({ url, init });
     const isHealth = new URL(url).pathname === '/auth/v1/health';
-    const r = isHealth ? health(refOf(url)) : respond(refOf(url), serviceOf(url));
+    const variant = variantOf(init);
+    const r = isHealth ? health(refOf(url)) : respond(refOf(url), serviceOf(url), variant);
     if (r instanceof Error) throw r;
-    const headers = r.version === undefined ? {} : { 'sb-gateway-version': r.version };
+    const version = 'version' in r ? r.version : variant === 'v2' ? '2.0' : '1';
+    const headers = version === undefined ? {} : { 'sb-gateway-version': version };
     return new Response(r.body ?? '{}', { status: r.status, headers });
   };
   return { fetchImpl, calls };
 }
 
-const control200 = (rejectStatus, versions = {}) => (ref, service) =>
-  ref === REF ? { status: 200, version: '2' } : { status: rejectStatus(service), version: versions[ref] ?? '2.0' };
+const control200 = (rejectStatus) => (ref, service, variant) =>
+  ref === REF ? { status: 200 } : { status: rejectStatus(service, variant) };
 
 async function run(opts) {
   const { respond, health, ownKey = 'sb_publishable_own', token = TOKEN } = opts;
@@ -102,7 +107,7 @@ test('same-ref target is a config error', async () => {
 test('sends the target key as apikey and the token as Bearer', async () => {
   const { calls } = await run({ respond: control200(() => 401) });
   const target = calls.filter((c) => refOf(c.url) === OTHER && serviceOf(c.url));
-  assert.equal(target.length, 4);
+  assert.equal(target.length, 8);
   for (const c of target) {
     assert.equal(c.init.headers.apikey, 'sb_publishable_other');
     assert.equal(c.init.headers.Authorization, `Bearer ${TOKEN}`);
@@ -123,10 +128,14 @@ test('rejection with a good control passes for every service', async () => {
   for (const s of SERVICES) {
     const r = await check(`cross_tenant_${s}`, { data });
     assert.equal(r.status, 'pass', s);
+    const [row] = r.actual;
+    assert.equal(row.target, OTHER);
+    assert.equal(row.result, 'rejected');
     assert.deepEqual(
-      { target: r.actual[0].target, gateway_version: r.actual[0].gateway_version, control_status: r.actual[0].control_status },
-      { target: OTHER, gateway_version: 'v2', control_status: 200 }
+      Object.fromEntries(Object.entries(row.variants).map(([v, x]) => [v, [x.gateway_version, x.control_gateway_version, x.control_status, x.result]])),
+      { v1: ['v1', 'v1', 200, 'rejected'], v2: ['v2', 'v2', 200, 'rejected'] }
     );
+    assert.equal(r.detail, `${OTHER}: v1 rejected (${STORAGE_REJECT[s]}), v2 rejected (${STORAGE_REJECT[s]})`);
   }
 });
 
@@ -136,7 +145,7 @@ for (const service of SERVICES) {
     const { data } = await run({ respond: control200((s) => (s === service ? status : 401)) });
     const r = await check(`cross_tenant_${service}`, { data });
     assert.equal(r.status, 'fail');
-    assert.match(r.detail, new RegExp(`^regression: .+ on ${OTHER} \\(gateway v2\\) accepted tenant ${REF}'s token`));
+    assert.match(r.detail, new RegExp(`^regression: .+ on ${OTHER} accepted tenant ${REF}'s token \\(v1 accepted \\(${status}\\), v2 accepted \\(${status}\\)\\)$`));
   });
 }
 
@@ -146,7 +155,7 @@ test('target health failure makes a rejection inconclusive', async () => {
     for (const s of SERVICES) {
       const r = await check(`cross_tenant_${s}`, { data });
       assert.equal(r.status, 'warn', s);
-      assert.match(r.detail, new RegExp(`${OTHER}: the target ref or key is not valid in this environment \\(GET /auth/v1/health returned `));
+      assert.match(r.detail, new RegExp(`${OTHER}: v1 inconclusive \\(the target ref or key is not valid in this environment \\(GET /auth/v1/health returned .*, v2 inconclusive \\(the target ref`));
     }
   }
 });
@@ -177,7 +186,7 @@ test('control and target errors keep a safe summary and no secrets', async () =>
   });
   const respond = (ref) => (ref === REF ? { status: 401, body, version: '2' } : { status: 401, body: '{"error_code":"no_authorization","msg":"nope"}', version: '2' });
   const { ct, data } = await run({ respond });
-  const row = evaluateRow(ct, 'rest');
+  const row = evaluateRow(ct, 'rest').variants.v2;
   assert.equal(row.control_error, 'PGRST301: JWT rejected <redacted> with <redacted>');
   assert.equal(row.error, 'no_authorization: nope');
   const json = JSON.stringify(ct);
@@ -191,7 +200,7 @@ test('control and target errors keep a safe summary and no secrets', async () =>
 test('error summaries are cut to 200 characters per field', async () => {
   const respond = (ref) => (ref === REF ? { status: 403, body: JSON.stringify({ msg: 'x'.repeat(500) }) } : { status: 401 });
   const { ct } = await run({ respond });
-  assert.equal(evaluateRow(ct, 'auth_admin').control_error.length, 200);
+  assert.equal(evaluateRow(ct, 'auth_admin').variants.v1.control_error.length, 200);
 });
 
 test('control failure still reports an accepting target as a regression', async () => {
@@ -227,27 +236,92 @@ test('REST 404 PGRST205 from a target means the token was accepted', async () =>
   assert.equal((await check('cross_tenant_rest', { data })).status, 'fail');
 });
 
-test('gateway coverage passes with v1 and v2 targets and warns otherwise', async () => {
-  const both = await run({
-    spec: `${OTHER}=a,${OTHER_V1}=b`,
-    respond: control200(() => 401, { [OTHER_V1]: '1.0' }),
-  });
+test('gateway coverage passes when every target answered v1 requests with v1 and v2 requests with v2', async () => {
+  const both = await run({ spec: `${OTHER}=a,${OTHER_V1}=b`, respond: control200(() => 401) });
   const r = await check('cross_tenant_gateway_coverage', { data: both.data });
   assert.equal(r.status, 'pass');
-  assert.deepEqual(r.actual.seen, ['v1', 'v2']);
+  assert.deepEqual(r.actual, [
+    { target: OTHER, v1: ['v1'], v2: ['v2'], missing: [] },
+    { target: OTHER_V1, v1: ['v1'], v2: ['v2'], missing: [] },
+  ]);
+});
 
-  const onlyV2 = await run({ respond: control200(() => 401) });
-  const w = await check('cross_tenant_gateway_coverage', { data: onlyV2.data });
+test('gateway coverage warns and names each target whose requests reached the wrong gateway', async () => {
+  const notForwarded = await run({
+    spec: `${OTHER}=a,${OTHER_V1}=b`,
+    respond: (ref) => (ref === REF ? { status: 200 } : { status: 401, ...(ref === OTHER_V1 && { version: '1' }) }),
+  });
+  const w = await check('cross_tenant_gateway_coverage', { data: notForwarded.data });
   assert.equal(w.status, 'warn');
-  assert.match(w.detail, /gateway v1/);
+  assert.equal(w.detail, `${OTHER_V1}: v2 requests were answered by v1`);
 
-  const onlyV1 = await run({ respond: control200(() => 401, { [OTHER]: '1' }) });
-  const v = await check('cross_tenant_gateway_coverage', { data: onlyV1.data });
-  assert.equal(v.status, 'warn');
-  assert.equal(v.detail, 'No target is served by api-gateway v2. The v2 gateway does not serve any projects yet, so only v1 can be checked now.');
+  const none = await run({ respond: (ref) => (ref === REF ? { status: 200 } : { status: 401, version: undefined }) });
+  const n = await check('cross_tenant_gateway_coverage', { data: none.data });
+  assert.equal(n.status, 'warn');
+  assert.equal(n.detail, `${OTHER}: v1 requests were answered by unknown, v2 requests were answered by unknown`);
+  assert.doesNotMatch(n.detail, /does not serve any projects/);
+});
 
-  const none = await run({ respond: (ref) => (ref === REF ? { status: 200 } : { status: 401 }) });
-  assert.deepEqual((await check('cross_tenant_gateway_coverage', { data: none.data })).actual.seen, ['unknown']);
+test('the forwarding header is sent only on v2 requests, to the target and to the control', async () => {
+  const { calls } = await run({ respond: control200(() => 401) });
+  const probes = calls.filter((c) => serviceOf(c.url));
+  for (const ref of [REF, OTHER]) {
+    const mine = probes.filter((c) => refOf(c.url) === ref);
+    assert.equal(mine.length, 8, ref);
+    assert.deepEqual(mine.filter((c) => 'sb-forward-traffic' in c.init.headers).map((c) => c.init.headers['sb-forward-traffic']), ['true', 'true', 'true', 'true']);
+  }
+  const health = calls.filter((c) => new URL(c.url).pathname === '/auth/v1/health');
+  assert.equal(health.length, 1);
+  assert.ok(!('sb-forward-traffic' in health[0].init.headers));
+});
+
+// v1 answer, v2 answer -> check status. The check status is the worst variant: fail > warn > pass.
+const ROLLUP = [
+  ['pass + pass = pass', { status: 401 }, { status: 401 }, 'pass'],
+  ['pass + warn = warn', { status: 401 }, { status: 503 }, 'warn'],
+  ['pass + fail = fail', { status: 401 }, { status: 200 }, 'fail'],
+  ['warn + fail = fail', { status: 503 }, { status: 200 }, 'fail'],
+];
+
+for (const [name, v1, v2, status] of ROLLUP) {
+  test(`variant rollup: ${name}`, async () => {
+    const { ct, data } = await run({ respond: (ref, service, variant) => (ref === REF ? { status: 200 } : variant === 'v2' ? v2 : v1) });
+    const results = { pass: 'rejected', warn: 'inconclusive', fail: 'accepted' };
+    assert.equal(evaluateRow(ct, 'rest').result, results[status]);
+    assert.equal((await check('cross_tenant_rest', { data })).status, status);
+  });
+}
+
+test('a v2 request that api-gateway v1 answered is inconclusive, also with no gateway header', async () => {
+  for (const version of ['1', undefined]) {
+    const { ct, data } = await run({ respond: (ref) => (ref === REF ? { status: 200, version: '2' } : { status: 401, version }) });
+    const row = evaluateRow(ct, 'rest');
+    assert.equal(row.variants.v1.result, 'rejected');
+    assert.deepEqual([row.variants.v2.result, row.variants.v2.reason], ['inconclusive', 'request was not forwarded to api-gateway v2']);
+    const r = await check('cross_tenant_rest', { data });
+    assert.equal(r.status, 'warn');
+    assert.equal(r.detail, `Inconclusive: ${OTHER}: v1 rejected (401), v2 inconclusive (request was not forwarded to api-gateway v2)`);
+  }
+});
+
+test('a v2 request that the target accepted is a regression even when api-gateway v1 answered it', async () => {
+  const { data } = await run({ respond: (ref, service, variant) => (ref === REF ? { status: 200 } : { status: variant === 'v2' ? 200 : 401, version: '1' }) });
+  const r = await check('cross_tenant_rest', { data });
+  assert.equal(r.status, 'fail');
+  assert.match(r.detail, /v1 rejected \(401\), v2 accepted \(200\)/);
+});
+
+test('each variant uses the control of the same variant', async () => {
+  const failingV2 = await run({ respond: (ref, service, variant) => (ref === REF ? { status: variant === 'v2' ? 401 : 200 } : { status: 401 }) });
+  const row = evaluateRow(failingV2.ct, 'rest');
+  assert.deepEqual([row.variants.v1.control_status, row.variants.v1.result], [200, 'rejected']);
+  assert.deepEqual([row.variants.v2.control_status, row.variants.v2.result], [401, 'inconclusive']);
+  assert.match(row.variants.v2.reason, /^control on this tenant returned 401/);
+
+  const controlNotForwarded = await run({ respond: (ref, service, variant) => (ref === REF ? { status: 200, version: '1' } : { status: 401 }) });
+  const v2 = evaluateRow(controlNotForwarded.ct, 'rest').variants.v2;
+  assert.deepEqual([v2.control_gateway_version, v2.result, v2.reason], ['v1', 'inconclusive', 'control on this tenant: request was not forwarded to api-gateway v2']);
+  assert.equal(evaluateRow(controlNotForwarded.ct, 'rest').variants.v1.result, 'rejected');
 });
 
 test('never returns the token or a 2xx body', async () => {
@@ -276,10 +350,10 @@ test('gateway rejection passes when the control fails', async () => {
   const { ct, data } = await run({ respond });
   const row = evaluateRow(ct, 'auth_admin');
   assert.equal(row.result, 'rejected');
-  assert.equal(row.reason, GATEWAY_REASON);
+  assert.equal(row.variants.v1.reason, GATEWAY_REASON);
   const r = await check('cross_tenant_auth_admin', { data });
   assert.equal(r.status, 'pass');
-  assert.equal(r.actual[0].reason, GATEWAY_REASON);
+  assert.equal(r.actual[0].variants.v2.reason, GATEWAY_REASON);
   assert.equal((await check('cross_tenant_rest', { data })).status, 'warn');
 });
 
@@ -287,7 +361,7 @@ test('gateway rejection applies to every service and to a failing target health 
   const respond = (ref) => (ref === REF ? { status: 403 } : { status: 401, body: GATEWAY_BODY });
   const { ct, data } = await run({ respond, health: () => ({ status: 404 }) });
   for (const service of SERVICES) {
-    assert.equal(evaluateRow(ct, service).reason, GATEWAY_REASON, service);
+    for (const v of ['v1', 'v2']) assert.equal(evaluateRow(ct, service).variants[v].reason, GATEWAY_REASON, `${service} ${v}`);
     assert.equal((await check(`cross_tenant_${service}`, { data })).status, 'pass', service);
   }
 });
@@ -297,7 +371,7 @@ test('a plain 401 without the gateway message is still inconclusive when the con
   const { ct, data } = await run({ respond });
   const row = evaluateRow(ct, 'auth_admin');
   assert.equal(row.result, 'inconclusive');
-  assert.match(row.reason, /control on this tenant returned 403/);
+  assert.match(row.variants.v1.reason, /control on this tenant returned 403/);
   assert.equal((await check('cross_tenant_auth_admin', { data })).status, 'warn');
 });
 

@@ -202,5 +202,5 @@ test('the JIT token is redacted from errors and never returned', async () => {
 test('the JIT checks are not part of gateway coverage', async () => {
   const { data } = await run();
   const r = await check('cross_tenant_gateway_coverage', { data });
-  assert.deepEqual(Object.keys(r.actual.targets[0]), ['target', 'gateway_versions']);
+  assert.deepEqual(Object.keys(r.actual[0]), ['target', 'v1', 'v2', 'missing']);
 });

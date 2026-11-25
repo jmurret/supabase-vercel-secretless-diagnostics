@@ -17,15 +17,17 @@ const refOf = (url) => new URL(url).hostname.split('.')[0];
 const xmlError = (code, message) => `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${code}</Code><Message>${message}</Message></Error>`;
 const DENIED = { status: 403, body: xmlError('AccessDenied', 'Access denied') };
 
-// s3(ref) -> { status, body? } | Error. Every other HTTP probe answers 401, health answers 200 unless told otherwise.
+// s3(ref, variant) -> { status, body? } | Error. Every other HTTP probe answers 401, health answers 200 unless told
+// otherwise. Each request is answered by the gateway of its variant.
 function stubFetch({ s3 = (ref) => (ref === REF ? { status: 200 } : DENIED), health = () => ({ status: 200 }) } = {}) {
   const calls = [];
   const fetchImpl = async (url, init) => {
     calls.push({ url, init });
     const { pathname } = new URL(url);
-    const r = pathname === '/auth/v1/health' ? health(refOf(url)) : pathname === '/storage/v1/s3/' ? s3(refOf(url)) : { status: 401 };
+    const variant = init?.headers?.['sb-forward-traffic'] ? 'v2' : 'v1';
+    const r = pathname === '/auth/v1/health' ? health(refOf(url)) : pathname === '/storage/v1/s3/' ? s3(refOf(url), variant) : { status: 401 };
     if (r instanceof Error) throw r;
-    return new Response(r.body ?? '{}', { status: r.status });
+    return new Response(r.body ?? '{}', { status: r.status, headers: { 'sb-gateway-version': variant === 'v2' ? '2' : '1' } });
   };
   return { fetchImpl, calls };
 }
@@ -74,6 +76,28 @@ test('S3 sends a signed ListBuckets with the target ref, the target key and the 
   assert.match(own.init.headers.authorization, new RegExp(`Credential=${REF}/`));
 });
 
+test('S3 v2 request signs the forwarding header with the other headers', async () => {
+  const { calls } = await run();
+  const target = s3Calls(calls, OTHER);
+  assert.equal(target.length, 2);
+  const [v1, v2] = target;
+  assert.equal(v1.init.headers['sb-forward-traffic'], undefined);
+  assert.equal(v2.init.headers['sb-forward-traffic'], 'true');
+  const expected = signRequest({
+    url: v2.url,
+    region: 'us-east-1',
+    service: 's3',
+    accessKeyId: OTHER,
+    secretAccessKey: OTHER_KEY,
+    sessionToken: TOKEN,
+    headers: { 'x-amz-content-sha256': v2.init.headers['x-amz-content-sha256'], 'sb-forward-traffic': 'true' },
+    now: NOW,
+  });
+  assert.equal(v2.init.headers.authorization, expected.headers.authorization);
+  assert.match(v2.init.headers.authorization, /SignedHeaders=host;sb-forward-traffic;x-amz-content-sha256;x-amz-date;x-amz-security-token, /);
+  assert.equal(s3Calls(calls, REF).filter((c) => c.init.headers['sb-forward-traffic'] === 'true').length, 1);
+});
+
 test('S3 region: target pooler cache, then hint, then own pooler host, then us-east-1', async () => {
   const hosts = (r) => `aws-0-${r}.pooler.supabase.com`;
   const regionOf = (ct) => [rowOf(ct, 'storage_s3').region, rowOf(ct, 'storage_s3').region_source];
@@ -98,10 +122,15 @@ test('S3: AccessDenied from the target with a good control passes and shows the 
   const { ct, data } = await run();
   const r = await check(S3_ID, { data });
   assert.equal(r.status, 'pass');
-  assert.deepEqual(
-    { target: r.actual[0].target, status: r.actual[0].status, error: r.actual[0].error, control_status: r.actual[0].control_status },
-    { target: OTHER, status: 403, error: 'AccessDenied: Access denied', control_status: 200 }
-  );
+  for (const v of ['v1', 'v2']) {
+    const x = r.actual[0].variants[v];
+    assert.deepEqual(
+      { status: x.status, error: x.error, control_status: x.control_status, gateway_version: x.gateway_version },
+      { status: 403, error: 'AccessDenied: Access denied', control_status: 200, gateway_version: v }
+    );
+  }
+  assert.equal(r.actual[0].target, OTHER);
+  assert.equal(r.detail, `${OTHER}: v1 rejected (403), v2 rejected (403)`);
   assert.equal(rowOf(ct, 'storage_s3').result, 'rejected');
 });
 
@@ -111,7 +140,7 @@ test('S3: credential errors with 401 or 403 are inconclusive and keep their S3 c
     const r = await check(S3_ID, { data });
     assert.equal(r.status, 'warn', code);
     assert.match(r.detail, /before it checked the token/);
-    assert.equal(r.actual[0].error, `${code}: nope`);
+    assert.equal(r.actual[0].variants.v1.error, `${code}: nope`);
   }
 });
 
@@ -119,7 +148,7 @@ test('S3: a 2xx from the target is a regression and no body is kept', async () =
   const { ct, data } = await run({ s3: (ref) => ({ status: 200, body: '<ListAllMyBucketsResult>other-tenant-bucket</ListAllMyBucketsResult>' + ref }) });
   const r = await check(S3_ID, { data });
   assert.equal(r.status, 'fail');
-  assert.match(r.detail, new RegExp(`^regression: Storage S3 on ${OTHER} .* accepted tenant ${REF}'s token`));
+  assert.match(r.detail, new RegExp(`^regression: Storage S3 on ${OTHER} accepted tenant ${REF}'s token \\(v1 accepted \\(200\\), v2 accepted \\(200\\)\\)`));
   assert.ok(!JSON.stringify(ct).includes('other-tenant-bucket'));
 });
 
@@ -133,21 +162,21 @@ test('S3: control failure makes the result inconclusive and shows the control er
 test('S3: a signature error on the control with a publishable key names the key type', async () => {
   const { ct, data } = await run({ s3: (ref) => (ref === REF ? { status: 403, body: xmlError('SignatureDoesNotMatch', 'bad signature') } : DENIED) });
   const row = rowOf(ct, 'storage_s3');
-  assert.match(row.control_error, /^SignatureDoesNotMatch: bad signature The S3 secret is a publishable key \(sb_publishable_\.\.\.\)\. Storage S3 may accept only the legacy anon key/);
+  assert.match(row.variants.v1.control_error, /^SignatureDoesNotMatch: bad signature The S3 secret is a publishable key \(sb_publishable_\.\.\.\)\. Storage S3 may accept only the legacy anon key/);
   assert.equal(row.result, 'inconclusive');
   assert.equal((await check(S3_ID, { data })).status, 'warn');
   const anon = await run({
     ownKey: 'eyJanon.key.value',
     s3: (ref) => (ref === REF ? { status: 403, body: xmlError('SignatureDoesNotMatch', 'bad signature') } : DENIED),
   });
-  assert.equal(rowOf(anon.ct, 'storage_s3').control_error, 'SignatureDoesNotMatch: bad signature');
+  assert.equal(rowOf(anon.ct, 'storage_s3').variants.v2.control_error, 'SignatureDoesNotMatch: bad signature');
 });
 
 test('S3: target health failure makes a rejection inconclusive but not a regression', async () => {
   const { data } = await run({ health: () => ({ status: 401 }) });
   const r = await check(S3_ID, { data });
   assert.equal(r.status, 'warn');
-  assert.match(r.detail, new RegExp(`${OTHER}: the target ref or key is not valid in this environment \\(GET /auth/v1/health returned 401\\)`));
+  assert.match(r.detail, new RegExp(`${OTHER}: v1 inconclusive \\(the target ref or key is not valid in this environment \\(GET /auth/v1/health returned 401\\)\\)`));
   const bad = await run({ s3: () => ({ status: 200 }), health: () => ({ status: 404 }) });
   assert.equal((await check(S3_ID, { data: bad.data })).status, 'fail');
 });
@@ -160,7 +189,7 @@ test('S3: the api-gateway 401 is a rejection even when the control and the healt
   });
   const row = rowOf(ct, 'storage_s3');
   assert.equal(row.result, 'rejected');
-  assert.equal(row.reason, 'api-gateway rejected the token: Vercel OIDC token not issued for this project');
+  assert.equal(row.variants.v2.reason, 'api-gateway rejected the token: Vercel OIDC token not issued for this project');
   assert.equal((await check(S3_ID, { data })).status, 'pass');
 });
 
@@ -184,10 +213,26 @@ test('S3: errors never keep the token or the key', async () => {
   assert.ok(!JSON.stringify(thrown.ct).includes(TOKEN));
 });
 
-test('S3 and websocket probes are not part of gateway coverage', async () => {
+test('S3 is part of gateway coverage and the websocket probe is not', async () => {
   const { data } = await run();
   const r = await check('cross_tenant_gateway_coverage', { data });
-  assert.deepEqual(r.actual.seen, ['unknown']);
+  assert.equal(r.status, 'pass');
+  const noS3Header = async (url, init) => {
+    const { pathname } = new URL(url);
+    const variant = init?.headers?.['sb-forward-traffic'] ? 'v2' : 'v1';
+    const headers = pathname === '/storage/v1/s3/' ? {} : { 'sb-gateway-version': variant === 'v2' ? '2' : '1' };
+    return new Response('{}', { status: refOf(url) === REF || pathname === '/auth/v1/health' ? 200 : 401, headers });
+  };
+  const ct = await runCrossTenant({ spec: `${OTHER}=${OTHER_KEY}`, ownUrl: OWN_URL, ownKey: OWN_KEY, token: TOKEN, fetchImpl: noS3Header, createClientImpl: fakeRealtime().createClientImpl, realtimeTimeoutMs: 30 });
+  const w = await check('cross_tenant_gateway_coverage', { data: oidcData({ cross_tenant: ct }) });
+  assert.equal(w.status, 'warn');
+  assert.deepEqual(w.actual[0], { target: OTHER, v1: ['unknown', 'v1'], v2: ['unknown', 'v2'], missing: ['v1', 'v2'] });
+});
+
+test('the websocket probe sends one join per tenant, without a v2 variant', async () => {
+  const { clients, ct } = await run();
+  assert.equal(clients.length, 2);
+  assert.equal(rowOf(ct, 'realtime_ws').variants, undefined);
 });
 
 test('websocket: join with the target key and the token; SUBSCRIBED is a regression', async () => {

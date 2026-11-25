@@ -5,6 +5,15 @@
 const { randomBytes } = require('node:crypto');
 const { findTargetPooler, isAuthRejection: isPoolerAuthRejection, poolerRegion, poolerHostCache } = require('./pooler-discovery');
 const { signRequest, EMPTY_PAYLOAD_SHA256 } = require('./sigv4');
+const {
+  GATEWAY_HEADER,
+  VARIANTS,
+  NOT_FORWARDED,
+  variantHeaders,
+  normalizeGatewayVersion,
+  isForwarded,
+  worstResult,
+} = require('./gateway-variants');
 
 const PROBE_TIMEOUT_MS = 5000;
 const REALTIME_TIMEOUT_MS = 8000;
@@ -12,7 +21,6 @@ const S3_PATH = '/storage/v1/s3/';
 const DEFAULT_S3_REGION = 'us-east-1';
 const S3_CREDENTIAL_CODES = ['SignatureDoesNotMatch', 'InvalidAccessKeyId', 'InvalidSignature'];
 const JIT_ROLE = 'postgres';
-const GATEWAY_HEADER = 'sb-gateway-version';
 const HEALTH_PATH = '/auth/v1/health';
 const MAX_ERROR_CHARS = 200;
 const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
@@ -55,9 +63,10 @@ const SERVICES = [
     request: `GET ${S3_PATH} (S3 ListBuckets, AWS SigV4, session token)`,
     expected: 'HTTP 401 or 403',
     isRejection: isAuthRejection,
-    noGateway: true,
     probe: probeS3,
   },
+  // The websocket upgrade response headers are not visible to the client, so the gateway version cannot be
+  // checked. A v2 request could not be told apart from a v1 request, so this probe sends only a v1 request.
   {
     id: 'realtime_ws',
     label: 'Realtime websocket',
@@ -68,11 +77,6 @@ const SERVICES = [
     classify: classifyRealtime,
   },
 ];
-
-function normalizeGatewayVersion(value) {
-  const match = /^v?(\d+)(?:\.\d+)*$/i.exec(String(value ?? '').trim());
-  return match ? `v${Number(match[1])}` : 'unknown';
-}
 
 const firstLabel = (hostname) => hostname.split('.')[0];
 
@@ -137,7 +141,7 @@ function summarizeError(text, secrets) {
   return [pick(['code', 'error_code', 'error']), pick(['msg', 'message'])].filter(Boolean).join(': ');
 }
 
-async function probe(fetchImpl, baseUrl, key, token, service) {
+async function probe(fetchImpl, baseUrl, key, token, service, variant) {
   const started = Date.now();
   try {
     const res = await fetchImpl(`${baseUrl}${service.path}`, {
@@ -145,6 +149,7 @@ async function probe(fetchImpl, baseUrl, key, token, service) {
       headers: {
         apikey: key,
         Authorization: `Bearer ${token}`,
+        ...variantHeaders(variant),
         ...(service.body && { 'content-type': 'application/json' }),
       },
       ...(service.body && { body: JSON.stringify(service.body) }),
@@ -174,7 +179,8 @@ const PUBLISHABLE_KEY_NOTE =
   'The S3 secret is a publishable key (sb_publishable_...). Storage S3 may accept only the legacy anon key as the secret access key.';
 
 // ListBuckets with the target ref as access key id, the target key as secret and the token as session token.
-async function probeS3(deps, { ref, url, key, token, region, isControl }) {
+// The forwarding header of the v2 request is signed with the other headers.
+async function probeS3(deps, { ref, url, key, token, region, isControl }, variant) {
   const started = Date.now();
   const secrets = [token, key];
   const extra = { region: region.name, region_source: region.source };
@@ -187,7 +193,7 @@ async function probeS3(deps, { ref, url, key, token, region, isControl }) {
       accessKeyId: ref,
       secretAccessKey: key,
       sessionToken: token,
-      headers: { 'x-amz-content-sha256': EMPTY_PAYLOAD_SHA256 },
+      headers: { 'x-amz-content-sha256': EMPTY_PAYLOAD_SHA256, ...variantHeaders(variant) },
       now: deps.now?.(),
     });
     const res = await deps.fetchImpl(target, {
@@ -244,11 +250,20 @@ async function probeRealtime(deps, { url, key, token }) {
   }
 }
 
-function probeService(deps, tenant, service) {
+function probeVariant(deps, tenant, service, variant) {
   return service.probe
-    ? service.probe(deps, tenant)
-    : probe(deps.fetchImpl, tenant.url, tenant.key, tenant.token, service);
+    ? service.probe(deps, tenant, variant)
+    : probe(deps.fetchImpl, tenant.url, tenant.key, tenant.token, service, variant);
 }
+
+// A gateway service answers { v1, v2 }. The websocket probe answers one result.
+async function probeService(deps, tenant, service) {
+  if (service.noGateway) return probeVariant(deps, tenant, service);
+  const results = await Promise.all(VARIANTS.map((v) => probeVariant(deps, tenant, service, v)));
+  return Object.fromEntries(VARIANTS.map((v, i) => [v, results[i]]));
+}
+
+const perVariant = (service, value) => (service.noGateway ? value : Object.fromEntries(VARIANTS.map((v) => [v, value])));
 
 async function probeAll(deps, tenant) {
   const results = await Promise.all(SERVICES.map((s) => probeService(deps, tenant, s)));
@@ -348,7 +363,7 @@ async function runCrossTenant({
   const [control, ...probes] = await Promise.all([
     ownKey
       ? probeAll(deps, { ref: own.ref, url: own.url, key: ownKey, token, region: ownRegion, isControl: true })
-      : Object.fromEntries(SERVICES.map((s) => [s.id, noKey])),
+      : Object.fromEntries(SERVICES.map((s) => [s.id, perVariant(s, noKey)])),
     ...targets.map(async (t) => {
       const region = pickRegion([
         ['target_pooler_cache', hostCache.get(t.ref)],
@@ -374,6 +389,7 @@ async function runCrossTenant({
 const GATEWAY_NOT_ISSUED_MESSAGE = 'Vercel OIDC token not issued for this project';
 
 const is2xx = (status) => status >= 200 && status < 300;
+const isGatewayRejection = (target) => target?.status === 401 && Boolean(target.error?.includes(GATEWAY_NOT_ISSUED_MESSAGE));
 
 const healthFailure = (health) => ({
   result: 'inconclusive',
@@ -410,7 +426,7 @@ function classify(service, control, target, health) {
   }
   if (s === null) return { result: 'inconclusive', reason: `network error: ${target?.error ?? 'no response'}` };
   if (s >= 500) return { result: 'inconclusive', reason: `HTTP ${s} from the target` };
-  if (s === 401 && target?.error?.includes(GATEWAY_NOT_ISSUED_MESSAGE)) {
+  if (isGatewayRejection(target)) {
     return { result: 'rejected', reason: `api-gateway rejected the token: ${GATEWAY_NOT_ISSUED_MESSAGE}` };
   }
   if (!is2xx(health?.status)) return healthFailure(health);
@@ -425,22 +441,70 @@ function classify(service, control, target, health) {
   return { result: 'inconclusive', reason: `unexpected HTTP ${s}` };
 }
 
+// A v2 result counts only when api-gateway v2 answered. A 2xx answer is a regression on any gateway.
+function classifyVariant(service, variant, control, target, health) {
+  const verdict = classify(service, control, target, health);
+  if (verdict.result === 'accepted' || target?.status == null || variant !== 'v2') return verdict;
+  if (!isForwarded(variant, target.gateway_version)) return { result: 'inconclusive', reason: NOT_FORWARDED };
+  if (verdict.result === 'rejected' && !isGatewayRejection(target) && !isForwarded(variant, control?.gateway_version)) {
+    return { result: 'inconclusive', reason: `control on this tenant: ${NOT_FORWARDED}` };
+  }
+  return verdict;
+}
+
+const controlFields = (control) => ({
+  control_status: control?.status ?? null,
+  ...(control?.error && { control_error: control.error }),
+});
+
+function variantRow(service, control, p, t) {
+  const variants = Object.fromEntries(
+    VARIANTS.map((v) => [
+      v,
+      {
+        gateway_version: p[v].gateway_version,
+        control_gateway_version: control?.[v]?.gateway_version ?? 'unknown',
+        ...controlFields(control?.[v]),
+        status: p[v].status,
+        ...(p[v].error && { error: p[v].error }),
+        ...classifyVariant(service, v, control?.[v], p[v], t.health),
+      },
+    ])
+  );
+  const regionOf = (r) => r?.v1?.region && { region: r.v1.region, region_source: r.v1.region_source };
+  const controlRegion = regionOf(control);
+  return {
+    target: t.ref,
+    result: worstResult(VARIANTS.map((v) => variants[v].result)),
+    variants,
+    ...regionOf(p),
+    ...(controlRegion && { control_region: controlRegion.region, control_region_source: controlRegion.region_source }),
+  };
+}
+
+function singleRow(service, control, p, t) {
+  return {
+    target: t.ref,
+    gateway_version: p.gateway_version,
+    ...controlFields(control),
+    status: p.status,
+    ...(p.error && { error: p.error }),
+    ...classify(service, control, p, t.health),
+  };
+}
+
+// Compact outcome of each variant, for example "v1 rejected (401), v2 inconclusive (request was not forwarded ...)".
+const describeVariants = (row) =>
+  VARIANTS.map((v) => {
+    const x = row.variants[v];
+    return `${v} ${x.result} (${x.result === 'inconclusive' ? x.reason : x.status})`;
+  }).join(', ');
+
 function evaluateService(data, service) {
   const control = data.own.control[service.id];
-  const rows = data.targets.map((t) => {
-    const p = t.probes[service.id];
-    return {
-      target: t.ref,
-      gateway_version: p.gateway_version,
-      control_status: control?.status ?? null,
-      ...(control?.error && { control_error: control.error }),
-      ...(control?.region && { control_region: control.region, control_region_source: control.region_source }),
-      status: p.status,
-      ...(p.error && { error: p.error }),
-      ...(p.region && { region: p.region, region_source: p.region_source }),
-      ...classify(service, control, p, t.health),
-    };
-  });
+  const rows = data.targets.map((t) =>
+    (service.noGateway ? singleRow : variantRow)(service, control, t.probes[service.id], t)
+  );
   const accepted = rows.filter((r) => r.result === 'accepted');
   const inconclusive = rows.filter((r) => r.result === 'inconclusive');
   return { rows, accepted, inconclusive };
@@ -549,13 +613,17 @@ function evaluateJitProbe(data, jit, probe) {
   };
 }
 
+// For each target, the gateway versions that answered the v1 requests and the v2 requests. A target is
+// covered when every v1 request was served by api-gateway v1 and every v2 request by api-gateway v2.
 function gatewayCoverage(data) {
-  const perTarget = data.targets.map((t) => ({
-    target: t.ref,
-    gateway_versions: [...new Set(SERVICES.filter((s) => !s.noGateway).map((s) => t.probes[s.id].gateway_version))].sort(),
-  }));
-  const seen = [...new Set(perTarget.flatMap((t) => t.gateway_versions))].sort();
-  return { perTarget, seen };
+  const services = SERVICES.filter((s) => !s.noGateway);
+  return data.targets.map((t) => {
+    const seen = Object.fromEntries(
+      VARIANTS.map((v) => [v, [...new Set(services.map((s) => t.probes[s.id]?.[v]?.gateway_version).filter(Boolean))].sort()])
+    );
+    const missing = VARIANTS.filter((v) => !seen[v].length || seen[v].some((version) => version !== v));
+    return { target: t.ref, ...seen, missing };
+  });
 }
 
 module.exports = {
@@ -565,6 +633,7 @@ module.exports = {
   parseTargets,
   runCrossTenant,
   evaluateService,
+  describeVariants,
   evaluateJitProbe,
   gatewayCoverage,
 };

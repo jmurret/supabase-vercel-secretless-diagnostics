@@ -48,7 +48,7 @@ test('control error detail does not repeat the status', async () => {
     fetchImpl: stub,
     createClientImpl: fakeRealtime().createClientImpl,
   });
-  const row = crossTenant.evaluateService(ct, crossTenant.SERVICES[0]).rows[0];
+  const row = crossTenant.evaluateService(ct, crossTenant.SERVICES[0]).rows[0].variants.v1;
   assert.equal(row.control_error, '403 bad_jwt: rejected');
   assert.match(row.reason, /control on this tenant returned 403;.*\(403 bad_jwt: rejected\)$/);
   assert.ok(!row.reason.includes('403 403'));
