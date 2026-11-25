@@ -6,9 +6,16 @@ const FORWARD_HEADER = 'sb-forward-traffic';
 const VARIANTS = ['v1', 'v2'];
 const NOT_FORWARDED = 'request was not forwarded to api-gateway v2';
 
+const FORWARDING_LOOP =
+  'request looped between api-gateway v1 and v2 (one sb-gateway-version value per hop), so no gateway answered it';
+const notForwardedReason = (gatewayVersion) => (gatewayVersion === 'loop' ? FORWARDING_LOOP : NOT_FORWARDED);
+
 const variantHeaders = (variant) => (variant === 'v2' ? { [FORWARD_HEADER]: 'true' } : {});
 
+// fetch joins repeated headers with ", ". Each gateway hop adds one value, so several values mean the request
+// was forwarded back and forth.
 function normalizeGatewayVersion(value) {
+  if (String(value ?? '').includes(',')) return 'loop';
   const match = /^v?(\d+)(?:\.\d+)*$/i.exec(String(value ?? '').trim());
   return match ? `v${Number(match[1])}` : 'unknown';
 }
@@ -24,7 +31,8 @@ module.exports = {
   GATEWAY_HEADER,
   FORWARD_HEADER,
   VARIANTS,
-  NOT_FORWARDED,
+  FORWARDING_LOOP,
+  notForwardedReason,
   variantHeaders,
   normalizeGatewayVersion,
   isForwarded,

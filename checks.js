@@ -3,7 +3,7 @@ const { RESYNC_HINT } = require('./pooler');
 const {
   SERVICES: CROSS_TENANT_SERVICES, JIT_PROBES, evaluateService, describeVariants, evaluateJitProbe, gatewayCoverage,
 } = require('./cross-tenant');
-const { FORWARD_HEADER, VARIANTS, NOT_FORWARDED, isForwarded, worstStatus } = require('./gateway-variants');
+const { FORWARD_HEADER, VARIANTS, notForwardedReason, isForwarded, worstStatus } = require('./gateway-variants');
 
 // Expectations from "Vercel Marketplace OIDC" (Vercel OIDC secretless spec, Nov 18).
 const SPEC = 'Vercel Marketplace OIDC (spec updated Nov 18)';
@@ -617,7 +617,7 @@ const CHECKS = [
       const missed = Object.entries(versions).filter(([, version]) => !isForwarded('v2', version));
       if (!missed.length) return pass('v2', versions);
       return warn('v2', versions,
-        `Not forwarded to api-gateway v2: ${missed.map(([name, version]) => `${name} (answered by ${version})`).join(', ')}. The v2 results of the database checks are inconclusive. Staging can have no forwarding configured.`);
+        `Not forwarded to api-gateway v2: ${missed.map(([name, version]) => `${name} (${version === 'loop' ? 'forwarding loop between v1 and v2' : `answered by ${version}`})`).join(', ')}. The v2 results of the database checks are inconclusive. Staging can have no forwarding configured.`);
     },
   },
   {
@@ -901,7 +901,8 @@ async function runOnGateways(check, c, deps) {
   outcomes.v2 = c.gatewayV2 ? await runOne(check, v2Context(c), deps) : skip('api-gateway v2 requests were not run.');
   if (outcomes.v2.status !== 'skip') {
     const versions = check.gateway.map((name) => c.gatewayV2.gateway_versions?.[name] ?? 'unknown');
-    if (versions.some((version) => !isForwarded('v2', version))) outcomes.v2 = warn(outcomes.v2.expected, outcomes.v2.actual, NOT_FORWARDED);
+    const missed = versions.find((version) => !isForwarded('v2', version));
+    if (missed) outcomes.v2 = warn(outcomes.v2.expected, outcomes.v2.actual, notForwardedReason(missed));
   }
   const statuses = VARIANTS.map((v) => outcomes[v].status);
   if (statuses.every((s) => s === 'skip')) return { ...outcomes.v1, variants: outcomes };

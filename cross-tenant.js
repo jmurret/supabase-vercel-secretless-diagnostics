@@ -8,7 +8,7 @@ const { signRequest, EMPTY_PAYLOAD_SHA256 } = require('./sigv4');
 const {
   GATEWAY_HEADER,
   VARIANTS,
-  NOT_FORWARDED,
+  notForwardedReason,
   variantHeaders,
   normalizeGatewayVersion,
   isForwarded,
@@ -506,9 +506,9 @@ function classify(service, control, target, health) {
 function classifyVariant(service, variant, control, target, health) {
   const verdict = classify(service, control, target, health);
   if (verdict.result === 'accepted' || target?.status == null || variant !== 'v2') return verdict;
-  if (!isForwarded(variant, target.gateway_version)) return { result: 'inconclusive', reason: NOT_FORWARDED };
+  if (!isForwarded(variant, target.gateway_version)) return { result: 'inconclusive', reason: notForwardedReason(target.gateway_version) };
   if (verdict.result === 'rejected' && !isGatewayRejection(target) && !isForwarded(variant, control?.gateway_version)) {
-    return { result: 'inconclusive', reason: `control on this tenant: ${NOT_FORWARDED}` };
+    return { result: 'inconclusive', reason: `control on this tenant: ${notForwardedReason(control?.gateway_version)}` };
   }
   return verdict;
 }
