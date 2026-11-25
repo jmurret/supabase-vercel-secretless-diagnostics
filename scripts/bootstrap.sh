@@ -16,8 +16,11 @@
 # .env.local has a publishable key. It needs the token to apply the migrations.
 # Step 4 offers to enable the Supabase IPv4 add-on when db.<project host> has no A record.
 # Step 5 enables JIT with scripts/enable-jit.sh.
-# Step 6 asks for optional cross-tenant targets (other Supabase projects) and sets
-# CROSS_TENANT_TARGETS. It runs only with a terminal.
+# Step 6 sets SUPABASE_ANON_KEY to the legacy anon key of this project when it is not set and
+# the token can read it (the Storage S3 cross-tenant check needs it). It then asks for optional
+# cross-tenant targets (other Supabase projects) and sets CROSS_TENANT_TARGETS. For each target
+# it reads the legacy anon key with the token, or asks for it (hidden). The target prompts run
+# only with a terminal.
 # Step 7 redeploys production.
 # A failure in step 4, 5, 6 or 7 only prints a warning.
 # Needs: vercel CLI, node, curl. Run `vercel link` once before.
@@ -127,6 +130,7 @@ Changes in $environments:
   set     SUPABASE_RESOURCE_ID=${resource_ref:-(not found, skipped)}
   replace .env.local with the Development variables (optional, for local development)
   enable  JIT access (SSL enforcement + JIT) on the Supabase project
+  set     SUPABASE_ANON_KEY to the legacy anon key (if not set and the token can read it)
   ask     for optional CROSS_TENANT_TARGETS (with a terminal)
   redeploy production
 EOF
@@ -384,6 +388,51 @@ org_of() {
     node -e 'try { const o = JSON.parse(require("fs").readFileSync(0, "utf8")).organization_id; if (typeof o === "string") console.log(o); } catch {}' || true
 }
 
+legacy_anon_key() {
+  curl -s --max-time 15 -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" "$mgmt/v1/projects/$1/api-keys" 2>/dev/null |
+    node -e '
+      try {
+        const keys = JSON.parse(require("fs").readFileSync(0, "utf8"));
+        for (const k of Array.isArray(keys) ? keys : []) {
+          if (k.name !== "anon" || typeof k.api_key !== "string") continue;
+          const p = JSON.parse(Buffer.from(k.api_key.split(".")[1] || "", "base64url").toString("utf8"));
+          if (p.role === "anon" && (p.ref === undefined || p.ref === process.argv[1])) {
+            process.stdout.write(k.api_key);
+            break;
+          }
+        }
+      } catch {}
+    ' "$1" || true
+}
+is_legacy_anon_key() {
+  printf '%s' "$1" | node -e '
+    try {
+      const p = JSON.parse(Buffer.from(require("fs").readFileSync(0, "utf8").split(".")[1] || "", "base64url").toString("utf8"));
+      process.exit(p.role === "anon" && (p.ref === undefined || p.ref === process.argv[1]) ? 0 : 1);
+    } catch {
+      process.exit(1);
+    }
+  ' "$2"
+}
+
+s3_control_warning() {
+  echo "${hl}Warning: $1 The Storage S3 cross-tenant check will be inconclusive until SUPABASE_ANON_KEY holds the legacy anon key of $ref.${reset}" >&2
+}
+if printf '%s\n' "$names" | grep -Fx SUPABASE_ANON_KEY >/dev/null; then
+  echo "SUPABASE_ANON_KEY is already set. The Storage S3 control uses it, so it must be the legacy anon key of $ref." >&2
+elif [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
+  s3_control_warning "No access token, so the legacy anon key was not read."
+else
+  own_anon="$(legacy_anon_key "$ref")"
+  if [ -z "$own_anon" ]; then
+    s3_control_warning "The token cannot read a legacy anon key for $ref (legacy keys may be disabled)."
+  elif set_config_env SUPABASE_ANON_KEY "$own_anon"; then
+    echo "SUPABASE_ANON_KEY set to the legacy anon key of $ref." >&2
+  else
+    s3_control_warning "SUPABASE_ANON_KEY was not set. The Vercel CLI failed."
+  fi
+fi
+
 if [ ! -t 0 ]; then
   echo "No terminal. Skipped. Set CROSS_TENANT_TARGETS on the Vercel project to enable the cross-tenant checks." >&2
 else
@@ -425,7 +474,26 @@ else
         echo "$t_ref is in a different organization than this project." >&2
       fi
     fi
-    targets="${targets:+$targets,}$t_ref=$t_key"
+    t_anon=""
+    if is_legacy_anon_key "$t_key" "$t_ref"; then
+      echo "The key for $t_ref is a legacy anon key. The Storage S3 check uses it." >&2
+    else
+      [ -z "$SUPABASE_ACCESS_TOKEN" ] || t_anon="$(legacy_anon_key "$t_ref")"
+      if [ -n "$t_anon" ]; then
+        echo "Found the legacy anon key for $t_ref." >&2
+      else
+        echo "The Storage S3 check needs the legacy anon key of $t_ref as the S3 secret." >&2
+        while true; do
+          read -rs -p "Legacy anon key for $t_ref (input hidden, leave empty to skip): " t_anon || t_anon=""
+          echo >&2
+          [ -n "$t_anon" ] || break
+          is_legacy_anon_key "$t_anon" "$t_ref" && break
+          echo "That is not the legacy anon key of $t_ref (a JWT with role anon). Try again, or leave empty to skip." >&2
+        done
+        [ -n "$t_anon" ] || echo "No legacy anon key for $t_ref. The Storage S3 check will be inconclusive for it." >&2
+      fi
+    fi
+    targets="${targets:+$targets,}$t_ref=$t_key${t_anon:+:$t_anon}"
     entered="$entered$t_ref "
     read -r -p "Add another target? [y/N] " more || more=""
     [[ "$more" =~ ^[Yy]$ ]] || break

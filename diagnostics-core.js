@@ -3,7 +3,7 @@ const { getVercelOidcToken } = require('@vercel/functions/oidc');
 const { Client } = require('pg');
 const { runChecks } = require('./checks');
 const { poolerLoginParams } = require('./pooler');
-const { runCrossTenant, runCrossTenantS3 } = require('./cross-tenant');
+const { runCrossTenant, runCrossTenantS3, isLegacyAnonKey } = require('./cross-tenant');
 const { parsePoolerHints, parseRegionHints } = require('./pooler-discovery');
 const { GATEWAY_HEADER, variantHeaders, normalizeGatewayVersion } = require('./gateway-variants');
 
@@ -331,6 +331,12 @@ async function runCrossTenantDiagnostics(req) {
 }
 
 const S3_CHECK_ID = 'cross_tenant_storage_s3';
+const S3_KEY_ENV_VARS = ['SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY'];
+
+function ownS3Key() {
+  const ref = SUPABASE_URL_INFO.project_ref ?? undefined;
+  return S3_KEY_ENV_VARS.map((name) => process.env[name]).find((value) => isLegacyAnonKey(value, ref));
+}
 
 // Runs the Storage S3 probes with the target regions from ?regions=<ref>:<region>,...
 async function runCrossTenantS3Diagnostics(req) {
@@ -338,7 +344,7 @@ async function runCrossTenantS3Diagnostics(req) {
   const crossTenantS3 = await runCrossTenantS3({
     spec: process.env.CROSS_TENANT_TARGETS,
     ownUrl: SUPABASE_URL,
-    ownKey: server.ctx?.apikey,
+    ownS3Key: ownS3Key(),
     token: server.ctx?.resourceToken,
     ownPoolerHost: process.env.POSTGRES_POOLER_HOST,
     regions: parseRegionHints(new URL(req.url ?? '/', 'http://localhost').searchParams.get('regions')),

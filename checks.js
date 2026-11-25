@@ -845,7 +845,7 @@ const CHECKS = [
   {
     id: 'cross_tenant_targets',
     group: 'cross_tenant',
-    description: 'CROSS_TENANT_TARGETS lists other tenants as <project ref or https:// URL>=<publishable or anon key>',
+    description: 'CROSS_TENANT_TARGETS lists other tenants as <project ref or https:// URL>=<publishable or anon key>[:<legacy anon key>]',
     run: (c) => {
       const s = needCrossTenant(c);
       if (s) return s;

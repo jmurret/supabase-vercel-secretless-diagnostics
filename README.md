@@ -14,7 +14,8 @@ Use a Vercel project that has the Supabase Marketplace integration. Then do thes
    - Applies the files in `supabase/migrations` (`public.whoami_vercel()` and `public.countries`). It asks once for a Supabase access token. Use an experimental API token. The token is hidden and is not saved. Press Enter to skip it, or set `SUPABASE_ACCESS_TOKEN` to skip the prompt. The schema step checks if the schema exists with the token. Without a token, it checks with the publishable key in `.env.local`, or skips the check. It needs the token to apply the migrations.
    - Offers to enable the Supabase IPv4 add-on when `db.<project host>` has no IPv4 address. The add-on is paid. Without it, the direct login check is skipped on Vercel. If the request fails, the script only prints a warning and the manual command.
    - Enables JIT access and SSL enforcement with the same token, until CTRL-2145 and CTRL-2146 are done. If this fails or you skipped the token, the script only prints a warning. Then run `pnpm run enable-jit`. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
-   - With a terminal, asks for optional cross-tenant targets and sets `CROSS_TENANT_TARGETS`. For each target, it asks for a project ref and a publishable key. It checks that the project accepts the key in the same environment (production or staging) as this project. With an access token, it also prints if the target is in the same organization. Leave the first ref empty to skip. If `CROSS_TENANT_TARGETS` is already set, an empty answer keeps it. See [Cross-tenant checks](#cross-tenant-checks).
+   - With an access token, reads the legacy anon key of this project from the Management API (`GET /v1/projects/<ref>/api-keys`) and sets `SUPABASE_ANON_KEY` to it. It does not change `SUPABASE_ANON_KEY` if the Vercel project already has it. If the key cannot be read (for example, legacy keys are disabled), the script prints a warning. The Storage S3 check is then inconclusive. The script never prints the key.
+   - With a terminal, asks for optional cross-tenant targets and sets `CROSS_TENANT_TARGETS`. For each target, it asks for a project ref and a publishable key. It checks that the project accepts the key in the same environment (production or staging) as this project. With an access token, it also prints if the target is in the same organization. Then it gets the legacy anon key of the target for the Storage S3 check. It reads the key with the access token. If the token cannot read it, the script asks for the key. The input is hidden. Leave it empty to skip. The script adds the key to the entry as `<ref>=<key>:<legacy anon key>`. Leave the first ref empty to skip. If `CROSS_TENANT_TARGETS` is already set, an empty answer keeps it. See [Cross-tenant checks](#cross-tenant-checks).
    - Redeploys the latest Ready production deployment, because a deployment only sees the variables that existed when it was built. If this fails, the script only prints a warning and the manual command.
 
 ## `GET /`
@@ -161,14 +162,19 @@ OIDC-only resources do not get `POSTGRES_URL`, `POSTGRES_PRISMA_URL`, `POSTGRES_
 
 These checks make sure that a resource token for this deployment's tenant (tenant A) gives no access to other tenants. They send the default-role (`service_role`) resource token, the same token that the Data API checks use, to the endpoints of other Supabase projects. Each request sends `apikey: <target key>` and `Authorization: Bearer <token>`. The target key lets the request pass the gateway apikey check, so only the Bearer token decides.
 
-Set `CROSS_TENANT_TARGETS` to a comma-separated list of `<target>=<key>` entries:
+Set `CROSS_TENANT_TARGETS` to a comma-separated list of `<target>=<key>[:<legacy anon key>]` entries:
 
 - `<target>` is a project ref or a full `https://` URL. For a project ref, the URL is `https://<ref>.` plus the domain of this deployment's `SUPABASE_URL` without its first label. For example, on staging the domain is `supabase.green`.
 - `<key>` is the publishable or anon key of that project. It is a public key.
+- `<legacy anon key>` is the legacy anon key of that project. It is optional. Only the Storage S3 check uses it. Put it after a `:`.
 
 ```sh
-CROSS_TENANT_TARGETS="abcdefghijklmnopqrst=sb_publishable_...,https://zyxwvutsrqponmlkjihg.supabase.co=eyJ..."
+CROSS_TENANT_TARGETS="abcdefghijklmnopqrst=sb_publishable_...:eyJ...,https://zyxwvutsrqponmlkjihg.supabase.co=eyJ..."
 ```
+
+The legacy anon key is a JWT. Its payload has `role` `anon`. If the payload has a `ref`, the `ref` must be the target ref. Other keys after the `:` are an entry error. If `<key>` is itself a legacy anon key, the S3 check uses it, and the second key is not needed. A target without a legacy anon key is not probed by the Storage S3 check. Its result is inconclusive.
+
+The Storage S3 check also needs `SUPABASE_ANON_KEY` (or `NEXT_PUBLIC_SUPABASE_ANON_KEY`) on this deployment. It must hold the legacy anon key of this project. The S3 control on this tenant uses it. Without it, the control is not sent and the S3 result is inconclusive.
 
 `pnpm run bootstrap` can build this list for you. If `CROSS_TENANT_TARGETS` is not set, all cross-tenant checks are skipped. An entry for this deployment's own project ref is a configuration error, because it is not a cross-tenant test.
 
@@ -207,10 +213,10 @@ Two more checks use the default-role token in a different way. They show the sam
 
 | Check | Request | Rejection |
 |---|---|---|
-| `cross_tenant_storage_s3` | `GET /storage/v1/s3/` (S3 `ListBuckets`, path style) signed with AWS SigV4. The access key id is the target ref. The secret access key is the target key. The token is the session token (`x-amz-security-token`). | `401` or `403` with an S3 error, such as `AccessDenied`. The S3 error code is in the result. `InvalidAccessKeyId`, `SignatureDoesNotMatch` and `InvalidSignature` give a warning, because the target rejected the key or signature before it checked the token. A `2xx` response fails the check. |
+| `cross_tenant_storage_s3` | `GET /storage/v1/s3/` (S3 `ListBuckets`, path style) signed with AWS SigV4. The access key id is the target ref. The secret access key is the legacy anon key of the target. The token is the session token (`x-amz-security-token`). | `401` or `403` with an S3 error, such as `AccessDenied`. The S3 error code is in the result. `InvalidAccessKeyId`, `SignatureDoesNotMatch` and `InvalidSignature` give a warning, because the target rejected the key or signature before it checked the token. A `2xx` response fails the check. |
 | `cross_tenant_realtime_ws` | Websocket join of a private channel `vercel-oidc-xtenant-<random>` with `@supabase/supabase-js`. The client uses the target key, and `realtime.setAuth` sets the token. | `CHANNEL_ERROR`. The error message is in the result. `SUBSCRIBED` fails the check. No answer in 8 seconds (`TIMED_OUT`) is inconclusive. |
 
-For `cross_tenant_storage_s3`, the signature uses the region of the project. The target region comes from the `regions` query parameter of [`/api/cross-tenant-s3`](#get-apicross-tenant-s3) (`region_source` `regions`). The control region comes from `POSTGRES_POOLER_HOST` (`control_region_source` `own_pooler_host`). Without a target region, the result is inconclusive (`target region unknown`). The control uses the same request on this tenant. If it fails with a signature or key error and the key is a publishable key, the control error says that Storage S3 may accept only the legacy anon key as the secret.
+For `cross_tenant_storage_s3`, the signature uses the region of the project. The target region comes from the `regions` query parameter of [`/api/cross-tenant-s3`](#get-apicross-tenant-s3) (`region_source` `regions`). The control region comes from `POSTGRES_POOLER_HOST` (`control_region_source` `own_pooler_host`). Without a target region, the result is inconclusive (`target region unknown`). The control uses the same request on this tenant, with the legacy anon key from `SUPABASE_ANON_KEY` as the secret. Storage S3 accepts only the legacy anon key as the secret, so a publishable key gives `SignatureDoesNotMatch`. A target without a legacy anon key, or a missing key for this tenant, is not probed. The result is inconclusive and states which key to add.
 
 For `cross_tenant_realtime_ws`, the control joins a private channel on this tenant. It can fail with `CHANNEL_ERROR` if this project has no policy on `realtime.messages` for the token. The control error shows the message.
 

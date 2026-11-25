@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { runCrossTenant, runCrossTenantS3, evaluateService, SERVICES } = require('../cross-tenant');
+const { runCrossTenant, runCrossTenantS3, evaluateService, parseTargets, SERVICES } = require('../cross-tenant');
 const { signRequest } = require('../sigv4');
 const { REF, oidcData, check, fakeRealtime } = require('./helpers');
 
@@ -9,6 +9,10 @@ const OTHER = 'zyxwvutsrqponmlkjihg';
 const TOKEN = 'header.payload.signature';
 const OWN_KEY = 'sb_publishable_own';
 const OTHER_KEY = 'sb_publishable_other';
+const b64url = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
+const jwt = (payload) => `${b64url({ alg: 'HS256', typ: 'JWT' })}.${b64url(payload)}.sig`;
+const OWN_ANON = jwt({ role: 'anon', ref: REF });
+const OTHER_ANON = jwt({ role: 'anon', ref: OTHER });
 const NOW = new Date('2026-11-25T10:00:00Z');
 const S3_ID = 'cross_tenant_storage_s3';
 const WS_ID = 'cross_tenant_realtime_ws';
@@ -39,8 +43,9 @@ async function run({
   s3,
   health,
   ws,
-  spec = `${OTHER}=${OTHER_KEY}`,
+  spec = `${OTHER}=${OTHER_KEY}:${OTHER_ANON}`,
   ownKey = OWN_KEY,
+  ownS3Key = OWN_ANON,
   token = TOKEN,
   regions = { [OTHER]: 'us-east-1' },
   ownPoolerHost = poolerHost('us-east-1'),
@@ -51,7 +56,7 @@ async function run({
   const common = { spec, ownUrl: OWN_URL, ownKey, token, fetchImpl, ...rest };
   const ct = {
     cross_tenant: await runCrossTenant({ ...common, createClientImpl: realtime.createClientImpl, realtimeTimeoutMs: 30, ...rest }),
-    cross_tenant_s3: await runCrossTenantS3({ ...common, regions, ownPoolerHost, now: () => NOW }),
+    cross_tenant_s3: await runCrossTenantS3({ ...common, ownS3Key, regions, ownPoolerHost, now: () => NOW }),
   };
   return { ct, calls, clients: realtime.clients, data: oidcData(ct) };
 }
@@ -59,7 +64,7 @@ async function run({
 const rowOf = (ct, id) => evaluateService(id === 'storage_s3' ? ct.cross_tenant_s3 : ct.cross_tenant, SERVICES.find((s) => s.id === id)).rows[0];
 const s3Calls = (calls, ref) => calls.filter((c) => new URL(c.url).pathname === '/storage/v1/s3/' && refOf(c.url) === ref);
 
-test('S3 sends a signed ListBuckets with the target ref, the target key and the token as session token', async () => {
+test('S3 sends a signed ListBuckets with the target ref, the legacy anon key and the token as session token', async () => {
   const { calls } = await run();
   const [call] = s3Calls(calls, OTHER);
   assert.equal(call.url, `https://${OTHER}.supabase.co/storage/v1/s3/`);
@@ -69,7 +74,7 @@ test('S3 sends a signed ListBuckets with the target ref, the target key and the 
     region: 'us-east-1',
     service: 's3',
     accessKeyId: OTHER,
-    secretAccessKey: OTHER_KEY,
+    secretAccessKey: OTHER_ANON,
     sessionToken: TOKEN,
     headers: { 'x-amz-content-sha256': call.init.headers['x-amz-content-sha256'] },
     now: NOW,
@@ -81,6 +86,17 @@ test('S3 sends a signed ListBuckets with the target ref, the target key and the 
   assert.ok(!JSON.stringify(call.init.headers.authorization).includes(TOKEN));
   const [own] = s3Calls(calls, REF);
   assert.match(own.init.headers.authorization, new RegExp(`Credential=${REF}/`));
+  const ownExpected = signRequest({
+    url: own.url,
+    region: 'us-east-1',
+    service: 's3',
+    accessKeyId: REF,
+    secretAccessKey: OWN_ANON,
+    sessionToken: TOKEN,
+    headers: { 'x-amz-content-sha256': own.init.headers['x-amz-content-sha256'] },
+    now: NOW,
+  });
+  assert.equal(own.init.headers.authorization, ownExpected.headers.authorization);
 });
 
 test('S3 v2 request signs the forwarding header with the other headers', async () => {
@@ -95,7 +111,7 @@ test('S3 v2 request signs the forwarding header with the other headers', async (
     region: 'us-east-1',
     service: 's3',
     accessKeyId: OTHER,
-    secretAccessKey: OTHER_KEY,
+    secretAccessKey: OTHER_ANON,
     sessionToken: TOKEN,
     headers: { 'x-amz-content-sha256': v2.init.headers['x-amz-content-sha256'], 'sb-forward-traffic': 'true' },
     now: NOW,
@@ -207,17 +223,98 @@ test('S3: control failure makes the result inconclusive and shows the control er
   assert.match(r.detail, /control on this tenant returned 403;.*\(AccessDenied: own denied\)/);
 });
 
-test('S3: a signature error on the control with a publishable key names the key type', async () => {
+test('S3: a signature error on the control is inconclusive and keeps its S3 code', async () => {
   const { ct, data } = await run({ s3: (ref) => (ref === REF ? { status: 403, body: xmlError('SignatureDoesNotMatch', 'bad signature') } : DENIED) });
   const row = rowOf(ct, 'storage_s3');
-  assert.match(row.variants.v1.control_error, /^SignatureDoesNotMatch: bad signature The S3 secret is a publishable key \(sb_publishable_\.\.\.\)\. Storage S3 may accept only the legacy anon key/);
+  assert.equal(row.variants.v2.control_error, 'SignatureDoesNotMatch: bad signature');
   assert.equal(row.result, 'inconclusive');
   assert.equal((await check(S3_ID, { data })).status, 'warn');
-  const anon = await run({
-    ownKey: 'eyJanon.key.value',
-    s3: (ref) => (ref === REF ? { status: 403, body: xmlError('SignatureDoesNotMatch', 'bad signature') } : DENIED),
+});
+
+test('S3: a second key after ":" is the S3 secret and the first key stays the apikey', async () => {
+  const { targets, errors } = parseTargets(`${OTHER}=${OTHER_KEY}:${OTHER_ANON}`, OWN_URL);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(targets, [{ ref: OTHER, url: `https://${OTHER}.supabase.co`, key: OTHER_KEY, s3Key: OTHER_ANON }]);
+  const { calls, clients } = await run();
+  assert.equal(clients.find((c) => c.url.includes(OTHER)).key, OTHER_KEY);
+  assert.ok(calls.filter((c) => refOf(c.url) === OTHER && new URL(c.url).pathname === '/auth/v1/health').every((c) => c.init.headers.apikey === OTHER_KEY));
+  const [call] = s3Calls(calls, OTHER);
+  const withPublishable = signRequest({
+    url: call.url,
+    region: 'us-east-1',
+    service: 's3',
+    accessKeyId: OTHER,
+    secretAccessKey: OTHER_KEY,
+    sessionToken: TOKEN,
+    headers: { 'x-amz-content-sha256': call.init.headers['x-amz-content-sha256'] },
+    now: NOW,
   });
-  assert.equal(rowOf(anon.ct, 'storage_s3').variants.v2.control_error, 'SignatureDoesNotMatch: bad signature');
+  assert.notEqual(call.init.headers.authorization, withPublishable.headers.authorization);
+});
+
+test('S3: a second key that is not the legacy anon key of the target is an entry error', () => {
+  const bad = {
+    'a publishable key': 'sb_publishable_x',
+    'a service role key': jwt({ role: 'service_role', ref: OTHER }),
+    'an anon key of another project': jwt({ role: 'anon', ref: REF }),
+    'an empty key': '',
+    'text with a dot': 'a.b.c',
+  };
+  for (const [name, second] of Object.entries(bad)) {
+    const { targets, errors } = parseTargets(`${OTHER}=${OTHER_KEY}:${second}`, OWN_URL);
+    assert.deepEqual(targets, [], name);
+    assert.equal(errors.length, 1, name);
+    assert.equal(errors[0].target, OTHER, name);
+    assert.ok(!errors[0].error.includes(second) || second === '', name);
+  }
+  const ok = parseTargets(`${OTHER}=${OTHER_KEY}:${jwt({ role: 'anon' })}`, OWN_URL);
+  assert.equal(ok.targets.length, 1);
+  assert.match(parseTargets(`${OTHER}=${OTHER_KEY}:`, OWN_URL).errors[0].error, /^Entry must be .*\[:<legacy anon key>\]\.$/);
+});
+
+test('S3: a main key that is a legacy anon key is used as the S3 key', async () => {
+  const { targets } = parseTargets(`${OTHER}=${OTHER_ANON}`, OWN_URL);
+  assert.equal(targets[0].s3Key, OTHER_ANON);
+  assert.equal(parseTargets(`${OTHER}=${OTHER_KEY}`, OWN_URL).targets[0].s3Key, undefined);
+  assert.equal(parseTargets(`${OTHER}=${jwt({ role: 'anon', ref: REF })}`, OWN_URL).targets[0].s3Key, undefined);
+  assert.equal(parseTargets(`${OTHER}=${jwt({ role: 'service_role', ref: OTHER })}`, OWN_URL).targets[0].s3Key, undefined);
+  const { calls } = await run({ spec: `${OTHER}=${OTHER_ANON}` });
+  const [call] = s3Calls(calls, OTHER);
+  const expected = signRequest({
+    url: call.url,
+    region: 'us-east-1',
+    service: 's3',
+    accessKeyId: OTHER,
+    secretAccessKey: OTHER_ANON,
+    sessionToken: TOKEN,
+    headers: { 'x-amz-content-sha256': call.init.headers['x-amz-content-sha256'] },
+    now: NOW,
+  });
+  assert.equal(call.init.headers.authorization, expected.headers.authorization);
+});
+
+test('S3: a target without a legacy anon key is not probed and is inconclusive', async () => {
+  const { ct, calls, data } = await run({ spec: `${OTHER}=${OTHER_KEY}` });
+  assert.equal(s3Calls(calls, OTHER).length, 0);
+  const reason = `no legacy anon key is set for this target; Storage S3 accepts only the legacy anon key as the S3 secret. Add it as ${OTHER}=<key>:<legacy anon key>`;
+  const row = rowOf(ct, 'storage_s3');
+  assert.equal(row.result, 'inconclusive');
+  assert.deepEqual([row.variants.v1.reason, row.variants.v2.reason], [reason, reason]);
+  const r = await check(S3_ID, { data });
+  assert.equal(r.status, 'warn');
+  assert.equal(r.detail, `Inconclusive: ${OTHER}: v1 inconclusive (${reason}), v2 inconclusive (${reason})`);
+});
+
+test('S3: without a legacy anon key for this tenant the control is not sent and the result is inconclusive', async () => {
+  for (const ownS3Key of [null, '']) {
+    const { ct, calls, data } = await run({ ownS3Key });
+    assert.equal(s3Calls(calls, REF).length, 0);
+    const reason = "Set SUPABASE_ANON_KEY to this project's legacy anon key; Storage S3 accepts only the legacy anon key as the S3 secret.";
+    assert.equal(rowOf(ct, 'storage_s3').variants.v1.control_error, reason);
+    const r = await check(S3_ID, { data });
+    assert.equal(r.status, 'warn');
+    assert.ok(r.detail.includes(`control on this tenant returned ${reason}`));
+  }
 });
 
 test('S3: target health failure makes a rejection inconclusive but not a regression', async () => {
@@ -250,15 +347,23 @@ test('S3: 5xx and network errors are inconclusive', async () => {
   assert.match(r.detail, /network error: connect ECONNREFUSED/);
 });
 
-test('S3: errors never keep the token or the key', async () => {
-  const body = (ref) => xmlError('SignatureDoesNotMatch', `token ${TOKEN} key ${ref === REF ? OWN_KEY : OTHER_KEY}`);
+test('S3: errors never keep the token or the S3 key', async () => {
+  const body = (ref) => xmlError('SignatureDoesNotMatch', `token ${TOKEN} key ${ref === REF ? OWN_ANON : OTHER_ANON}`);
   const { ct, data } = await run({ s3: (ref) => ({ status: 403, body: body(ref) }) });
-  const json = JSON.stringify(ct);
-  assert.ok(!json.includes(TOKEN) && !json.includes(OTHER_KEY) && !json.includes(OWN_KEY));
-  assert.ok(json.includes('<redacted>'));
-  assert.ok(!JSON.stringify(await check(S3_ID, { data })).includes(TOKEN));
-  const thrown = await run({ s3: () => new Error(`failed with ${TOKEN}`) });
-  assert.ok(!JSON.stringify(thrown.ct).includes(TOKEN));
+  const s3Json = JSON.stringify(ct.cross_tenant_s3);
+  assert.ok(!s3Json.includes(TOKEN) && !s3Json.includes(OTHER_ANON) && !s3Json.includes(OWN_ANON));
+  assert.ok(s3Json.includes('<redacted>'));
+  const checked = JSON.stringify(await check(S3_ID, { data }));
+  assert.ok(!checked.includes(TOKEN) && !checked.includes(OTHER_ANON) && !checked.includes(OWN_ANON));
+  const thrown = await run({ s3: (ref) => new Error(`failed with ${TOKEN} and ${ref === REF ? OWN_ANON : OTHER_ANON}`) });
+  const thrownJson = JSON.stringify(thrown.ct.cross_tenant_s3);
+  assert.ok(!thrownJson.includes(TOKEN) && !thrownJson.includes(OTHER_ANON) && !thrownJson.includes(OWN_ANON));
+});
+
+test('S3: results never keep the S3 keys', async () => {
+  const { ct, data } = await run();
+  const json = JSON.stringify([ct.cross_tenant_s3, await check(S3_ID, { data })]);
+  assert.ok(!json.includes(OTHER_ANON) && !json.includes(OWN_ANON) && !json.includes(OTHER_KEY));
 });
 
 test('S3 and the websocket probe are not part of gateway coverage', async () => {
@@ -350,11 +455,9 @@ test('websocket: errors never keep the token or the key', async () => {
   assert.ok(!JSON.stringify(await check(WS_ID, { data })).includes(TOKEN));
 });
 
-test('both probes warn when this tenant has no key for the control', async () => {
+test('the websocket probe warns when this tenant has no key for the control', async () => {
   const { data } = await run({ ownKey: '' });
-  for (const id of [S3_ID, WS_ID]) {
-    const r = await check(id, { data });
-    assert.equal(r.status, 'warn', id);
-    assert.match(r.detail, /No publishable or anon key is set for this tenant/);
-  }
+  const r = await check(WS_ID, { data });
+  assert.equal(r.status, 'warn');
+  assert.match(r.detail, /No publishable or anon key is set for this tenant/);
 });

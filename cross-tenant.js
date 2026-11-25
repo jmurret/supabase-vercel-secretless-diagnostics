@@ -23,7 +23,9 @@ const JIT_ROLE = 'postgres';
 const HEALTH_PATH = '/auth/v1/health';
 const MAX_ERROR_CHARS = 200;
 const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
-const TARGETS_HINT = 'Set it to comma-separated <project ref or https:// URL>=<publishable or anon key> entries for other tenants.';
+const ENTRY_FORMAT = '<project ref or https:// URL>=<publishable or anon key>[:<legacy anon key>]';
+const TARGETS_HINT = `Set it to comma-separated ${ENTRY_FORMAT} entries for other tenants.`;
+const S3_KEY_REASON = 'Storage S3 accepts only the legacy anon key as the S3 secret.';
 
 const isAuthRejection = (status) => status === 401 || status === 403;
 // Storage and Realtime can reject with other 4xx codes (Storage answers 400 with an error body).
@@ -80,6 +82,22 @@ const SERVICES = [
 
 const firstLabel = (hostname) => hostname.split('.')[0];
 
+function decodeJwtPayload(token) {
+  try {
+    const parts = token.split('.');
+    return parts.length === 3 ? JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) : null;
+  } catch {
+    return null;
+  }
+}
+
+// A legacy anon key is a JWT with role anon. When the payload has a ref, it must match the project ref.
+function isLegacyAnonKey(key, ref) {
+  const payload = decodeJwtPayload(key ?? '');
+  if (!payload || typeof payload !== 'object' || payload.role !== 'anon') return false;
+  return payload.ref === undefined || ref === undefined || payload.ref === ref;
+}
+
 // Targets are reported without their keys.
 function parseTargets(spec, ownUrl) {
   const own = new URL(ownUrl);
@@ -90,9 +108,12 @@ function parseTargets(spec, ownUrl) {
   for (const entry of (spec ?? '').split(',').map((e) => e.trim()).filter(Boolean)) {
     const eq = entry.indexOf('=');
     const target = (eq < 0 ? entry : entry.slice(0, eq)).trim();
-    const key = eq < 0 ? '' : entry.slice(eq + 1).trim();
-    if (!target || !key) {
-      errors.push({ target: target || null, error: 'Entry must be <project ref or https:// URL>=<publishable or anon key>.' });
+    const keyPart = eq < 0 ? '' : entry.slice(eq + 1).trim();
+    const colon = keyPart.indexOf(':');
+    const key = (colon < 0 ? keyPart : keyPart.slice(0, colon)).trim();
+    const s3Entry = colon < 0 ? null : keyPart.slice(colon + 1).trim();
+    if (!target || !key || s3Entry === '') {
+      errors.push({ target: target || null, error: `Entry must be ${ENTRY_FORMAT}.` });
       continue;
     }
     let url;
@@ -119,7 +140,12 @@ function parseTargets(spec, ownUrl) {
       errors.push({ target, error: `Same tenant as this deployment (${ownRef}), so it is not a cross-tenant test.` });
       continue;
     }
-    targets.push({ ref, url, key });
+    if (s3Entry !== null && !isLegacyAnonKey(s3Entry, ref)) {
+      errors.push({ target, error: `The key after ":" must be the legacy anon key of ${ref} (a JWT with role anon).` });
+      continue;
+    }
+    const s3Key = s3Entry ?? (isLegacyAnonKey(key, ref) ? key : null);
+    targets.push({ ref, url, key, ...(s3Key && { s3Key }) });
   }
   return { own: { ref: ownRef, url: own.origin }, targets, errors };
 }
@@ -175,14 +201,11 @@ function summarizeS3Error(text, secrets) {
   return parts.length ? parts.map((p) => redact(p, secrets).slice(0, MAX_ERROR_CHARS)).join(': ') : summarizeError(text, secrets);
 }
 
-const PUBLISHABLE_KEY_NOTE =
-  'The S3 secret is a publishable key (sb_publishable_...). Storage S3 may accept only the legacy anon key as the secret access key.';
-
-// ListBuckets with the target ref as access key id, the target key as secret and the token as session token.
+// ListBuckets with the target ref as access key id, the legacy anon key as secret and the token as session token.
 // The forwarding header of the v2 request is signed with the other headers.
-async function probeS3(deps, { ref, url, key, token, region, isControl }, variant) {
+async function probeS3(deps, { ref, url, s3Key, token, region }, variant) {
   const started = Date.now();
-  const secrets = [token, key];
+  const secrets = [token, s3Key];
   const extra = { region: region.name, region_source: region.source };
   try {
     const target = `${url}${S3_PATH}`;
@@ -191,7 +214,7 @@ async function probeS3(deps, { ref, url, key, token, region, isControl }, varian
       region: region.name,
       service: 's3',
       accessKeyId: ref,
-      secretAccessKey: key,
+      secretAccessKey: s3Key,
       sessionToken: token,
       headers: { 'x-amz-content-sha256': EMPTY_PAYLOAD_SHA256, ...variantHeaders(variant) },
       now: deps.now?.(),
@@ -205,11 +228,7 @@ async function probeS3(deps, { ref, url, key, token, region, isControl }, varian
     const header = res.headers.get(GATEWAY_HEADER);
     const result = { status: res.status, gateway_version: normalizeGatewayVersion(header), gateway_header: header, ...extra };
     if (res.ok) await res.body?.cancel?.();
-    else {
-      const error = summarizeS3Error(await res.text(), secrets);
-      const credentialError = S3_CREDENTIAL_CODES.some((code) => error.startsWith(code));
-      result.error = isControl && credentialError && key.startsWith('sb_publishable_') ? `${error} ${PUBLISHABLE_KEY_NOTE}` : error;
-    }
+    else result.error = summarizeS3Error(await res.text(), secrets);
     return { ...result, ms: Date.now() - started };
   } catch (err) {
     return { status: null, gateway_version: 'unknown', gateway_header: null, ...extra, error: cut(err.message, secrets), ms: Date.now() - started };
@@ -363,7 +382,7 @@ async function runCrossTenant({
   const { own, targets, errors } = parseTargets(spec, ownUrl);
   const deps = { fetchImpl, createClientImpl, realtimeTimeoutMs };
   const [control, ...probes] = await Promise.all([
-    ownKey ? probeAll(deps, { ref: own.ref, url: own.url, key: ownKey, token, isControl: true }, LOCAL_SERVICES) : noKeyResults(LOCAL_SERVICES),
+    ownKey ? probeAll(deps, { ref: own.ref, url: own.url, key: ownKey, token }, LOCAL_SERVICES) : noKeyResults(LOCAL_SERVICES),
     ...targets.map(async (t) => {
       const [targetProbes, health, jitResults] = await Promise.all([
         probeAll(deps, { ref: t.ref, url: t.url, key: t.key, token }, LOCAL_SERVICES),
@@ -381,31 +400,36 @@ async function runCrossTenant({
 }
 
 const TARGET_REGION_UNKNOWN = 'target region unknown';
+const NO_OWN_S3_KEY = `Set SUPABASE_ANON_KEY to this project's legacy anon key; ${S3_KEY_REASON}`;
+const noTargetS3Key = (ref) =>
+  `no legacy anon key is set for this target; ${S3_KEY_REASON} Add it as ${ref}=<key>:<legacy anon key>`;
 const OWN_REGION_UNKNOWN = 'the region of this tenant is unknown: POSTGRES_POOLER_HOST does not name one';
 const regionalResults = (result) => Object.fromEntries(REGIONAL_SERVICES.map((s) => [s.id, perVariant(s, result)]));
 
 // The S3 signature needs the region of the project. regions is { <target ref>: <region> }, from the dashboard,
 // which reads it from the pooler host that /api/cross-tenant found. The control region comes from
-// POSTGRES_POOLER_HOST (aws-<n>-<region>.pooler...). A target without a region is not probed.
-async function runCrossTenantS3({ spec, ownUrl, ownKey, token, ownPoolerHost, regions = {}, fetchImpl = (...args) => fetch(...args), now }) {
+// POSTGRES_POOLER_HOST (aws-<n>-<region>.pooler...). A target without a region or without a legacy anon key is not
+// probed. ownS3Key is the legacy anon key of this tenant.
+async function runCrossTenantS3({ spec, ownUrl, ownS3Key, token, ownPoolerHost, regions = {}, fetchImpl = (...args) => fetch(...args), now }) {
   const skipped = notRunnable(spec, token, ownUrl);
   if (skipped) return skipped;
   const { own, targets, errors } = parseTargets(spec, ownUrl);
   const deps = { fetchImpl, now };
   const ownRegion = poolerRegion(ownPoolerHost);
-  const control = !ownKey
-    ? noKeyResults(REGIONAL_SERVICES)
+  const control = !ownS3Key
+    ? regionalResults({ status: null, gateway_version: 'unknown', error: NO_OWN_S3_KEY })
     : ownRegion
-      ? probeAll(deps, { ref: own.ref, url: own.url, key: ownKey, token, region: { name: ownRegion, source: 'own_pooler_host' }, isControl: true }, REGIONAL_SERVICES)
+      ? probeAll(deps, { ref: own.ref, url: own.url, s3Key: ownS3Key, token, region: { name: ownRegion, source: 'own_pooler_host' } }, REGIONAL_SERVICES)
       : regionalResults({ status: null, gateway_version: 'unknown', error: OWN_REGION_UNKNOWN });
   const [controlResults, ...probes] = await Promise.all([
     control,
     ...targets.map(async (t) => {
       const region = regions[t.ref];
+      const unprobed = !t.s3Key ? noTargetS3Key(t.ref) : !region ? TARGET_REGION_UNKNOWN : null;
       const [targetProbes, health] = await Promise.all([
-        region
-          ? probeAll(deps, { ref: t.ref, url: t.url, key: t.key, token, region: { name: region, source: 'regions' } }, REGIONAL_SERVICES)
-          : regionalResults({ status: null, gateway_version: 'unknown', unprobed: TARGET_REGION_UNKNOWN }),
+        unprobed
+          ? regionalResults({ status: null, gateway_version: 'unknown', unprobed })
+          : probeAll(deps, { ref: t.ref, url: t.url, s3Key: t.s3Key, token, region: { name: region, source: 'regions' } }, REGIONAL_SERVICES),
         probeHealth(fetchImpl, t.url, t.key),
       ]);
       return { probes: targetProbes, health };
@@ -669,6 +693,7 @@ module.exports = {
   JIT_PROBES,
   normalizeGatewayVersion,
   parseTargets,
+  isLegacyAnonKey,
   runCrossTenant,
   runCrossTenantS3,
   evaluateService,
