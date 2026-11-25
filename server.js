@@ -1,5 +1,6 @@
 const http = require('http');
 const diagnostics = require('./api/diagnostics');
+const crossTenant = require('./api/cross-tenant');
 const dashboardHtml = require('./dashboard');
 
 const server = http.createServer(async (req, res) => {
@@ -9,6 +10,8 @@ const server = http.createServer(async (req, res) => {
     res.end(dashboardHtml);
   } else if (path === '/api/diagnostics') {
     await diagnostics(req, res);
+  } else if (path === '/api/cross-tenant') {
+    await crossTenant(req, res);
   } else {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));

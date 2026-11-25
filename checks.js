@@ -842,10 +842,12 @@ const CHECKS = [
   },
 ];
 
-async function runChecks(data, ctx, { env = process.env, now = Date.now, fetchImpl = fetch } = {}) {
+// include and exclude are lists of group names. The summary covers only the checks that ran.
+async function runChecks(data, ctx, { env = process.env, now = Date.now, fetchImpl = fetch, include, exclude } = {}) {
   const c = buildContext(data, ctx, env, now());
   const results = [];
-  for (const check of CHECKS) {
+  const selected = CHECKS.filter((check) => (!include || include.includes(check.group)) && !exclude?.includes(check.group));
+  for (const check of selected) {
     let outcome;
     try {
       outcome = await check.run(c, { fetchImpl });

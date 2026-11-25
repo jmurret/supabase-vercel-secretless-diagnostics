@@ -10,6 +10,7 @@ module.exports = `<!DOCTYPE html>
       --warn: #ca8a04; --warn-bg: #fef9c3;
       --fail: #dc2626; --fail-bg: #fee2e2;
       --skip: #6b7280; --skip-bg: #f3f4f6;
+      --pending: #94a3b8; --pending-bg: #f8fafc;
     }
     * { box-sizing: border-box; }
     body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 24px; background: #f8fafc; color: #0f172a; }
@@ -37,6 +38,8 @@ module.exports = `<!DOCTYPE html>
     .check.pass { background: var(--pass-bg); } .check.warn { background: var(--warn-bg); }
     .check.fail { background: var(--fail-bg); }
     .check.skip { background: var(--skip-bg); }
+    .check.pending { border-color: var(--pending); border-left-style: dashed; background: var(--pending-bg); color: #64748b; font-style: italic; }
+    .pill.pending { background: var(--pending-bg); color: #64748b; border: 2px dashed var(--pending); }
     .error { color: var(--fail); }
     details { margin-top: 24px; }
     pre { background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 6px; overflow: auto; font-size: 12px; }
@@ -50,13 +53,19 @@ module.exports = `<!DOCTYPE html>
   </header>
   <main id="checks"><p class="meta">Loading…</p></main>
   <details>
-    <summary>Raw response (<a href="/api/diagnostics">/api/diagnostics</a>)</summary>
+    <summary>Raw responses (<a href="/api/diagnostics">/api/diagnostics</a>, <a href="/api/cross-tenant">/api/cross-tenant</a>)</summary>
     <pre id="raw"></pre>
   </details>
   <script>
-    const LABELS = { pass: 'Pass', warn: 'Warning', fail: 'Fail', skip: 'Skipped' };
-    const STATUSES = Object.keys(LABELS);
+    const LABELS = { pass: 'Pass', warn: 'Warning', fail: 'Fail', skip: 'Skipped', pending: 'Loading' };
+    const STATUSES = ['pass', 'warn', 'fail', 'skip'];
+    const CROSS_TENANT_PLACEHOLDER = {
+      id: 'cross_tenant', group: 'cross_tenant', description: 'Cross-tenant checks', status: 'pending', detail: 'Loading…', placeholder: true,
+    };
     let results = [];
+    let diagnosticsResults = null;
+    let crossTenantResults = [CROSS_TENANT_PLACEHOLDER];
+    const raw = { diagnostics: null, cross_tenant: null };
     let filter = STATUSES.includes(location.hash.slice(1)) ? location.hash.slice(1) : null;
 
     function el(tag, attrs = {}, ...children) {
@@ -77,7 +86,7 @@ module.exports = `<!DOCTYPE html>
           el('span', {}, r.description, ' ', el('span', { className: 'id', textContent: r.id })),
           el('span', { className: 'pill ' + r.status, textContent: LABELS[r.status] || r.status })),
         r.detail ? el('div', { className: 'detail', textContent: r.detail }) : null,
-        r.status === 'skip' ? null : dl);
+        r.status === 'skip' || r.status === 'pending' || r.placeholder ? null : dl);
     }
 
     function setFilter(status) {
@@ -95,7 +104,7 @@ module.exports = `<!DOCTYPE html>
       }
       const groups = new Map();
       for (const r of results) {
-        if (filter && r.status !== filter) continue;
+        if (filter && r.status !== filter && r.status !== 'pending') continue;
         if (!groups.has(r.group)) groups.set(r.group, []);
         groups.get(r.group).push(r);
       }
@@ -144,33 +153,70 @@ module.exports = `<!DOCTYPE html>
       return pairs.length ? '?pooler_hints=' + encodeURIComponent(pairs.join(',')) : '';
     }
 
-    async function load() {
-      const main = document.getElementById('checks');
-      const summary = document.getElementById('summary');
-      const meta = document.getElementById('meta');
+    async function fetchJson(url, rawKey) {
+      const res = await fetch(url, { cache: 'no-store', headers: { accept: 'application/json' } });
+      const body = await res.json();
+      raw[rawKey] = body;
+      document.getElementById('raw').textContent = JSON.stringify(raw, null, 2);
+      if (!res.ok) throw new Error(body.error || 'HTTP ' + res.status);
+      return body;
+    }
+
+    function summarize(items) {
+      const count = (status) => items.filter((r) => r.status === status).length;
+      const s = { passed: count('pass'), warned: count('warn'), failed: count('fail'), skipped: count('skip'), pending: count('pending') };
+      s.status = s.failed ? 'fail' : s.warned ? 'warn' : 'pass';
+      return s;
+    }
+
+    function renderSummary() {
+      const s = summarize(results);
+      const pills = [
+        pill(s.status, 'Overall: ' + LABELS[s.status], 'all'),
+        pill('pass', s.passed + ' passed', 'pass', s.passed),
+        pill('warn', s.warned + ' warnings', 'warn', s.warned),
+        pill('fail', s.failed + ' failed', 'fail', s.failed),
+        pill('skip', s.skipped + ' skipped', 'skip', s.skipped),
+      ];
+      if (s.pending) pills.push(el('span', { className: 'pill pending', textContent: s.pending + ' loading' }));
+      document.getElementById('summary').replaceChildren(...pills);
+    }
+
+    function update() {
+      if (!diagnosticsResults) return;
+      results = [...diagnosticsResults, ...crossTenantResults];
+      renderSummary();
+      render();
+    }
+
+    async function loadDiagnostics() {
       try {
-        const res = await fetch('/api/diagnostics' + hintsQuery(), { cache: 'no-store', headers: { accept: 'application/json' } });
-        const body = await res.json();
-        document.getElementById('raw').textContent = JSON.stringify(body, null, 2);
-        if (!res.ok) throw new Error(body.error || 'HTTP ' + res.status);
-        const { checks, data } = body;
-        saveHints(data.cross_tenant && data.cross_tenant.targets);
-        const s = checks.summary;
-        summary.replaceChildren(
-          pill(s.status, 'Overall: ' + LABELS[s.status], 'all'),
-          pill('pass', s.passed + ' passed', 'pass', s.passed),
-          pill('warn', s.warned + ' warnings', 'warn', s.warned),
-          pill('fail', s.failed + ' failed', 'fail', s.failed),
-          pill('skip', s.skipped + ' skipped', 'skip', s.skipped));
+        const { checks, data } = await fetchJson('/api/diagnostics', 'diagnostics');
         const env = data.environment || {};
-        meta.textContent = [checks.spec, env.vercel_env, env.vercel_region, env.supabase_url_host, data.timestamp]
+        document.getElementById('meta').textContent = [checks.spec, env.vercel_env, env.vercel_region, env.supabase_url_host, data.timestamp]
           .filter(Boolean).join(' · ');
-        results = checks.results;
-        render();
+        diagnosticsResults = checks.results;
+        update();
       } catch (err) {
-        summary.replaceChildren();
-        main.replaceChildren(el('p', { className: 'error', textContent: 'Failed to load diagnostics: ' + err.message }));
+        document.getElementById('summary').replaceChildren();
+        document.getElementById('checks').replaceChildren(el('p', { className: 'error', textContent: 'Failed to load diagnostics: ' + err.message }));
       }
+    }
+
+    async function loadCrossTenant() {
+      try {
+        const { checks, data } = await fetchJson('/api/cross-tenant' + hintsQuery(), 'cross_tenant');
+        saveHints(data.cross_tenant && data.cross_tenant.targets);
+        crossTenantResults = checks.results;
+      } catch (err) {
+        crossTenantResults = [{ ...CROSS_TENANT_PLACEHOLDER, status: 'warn', detail: 'Failed to load cross-tenant checks: ' + err.message }];
+      }
+      update();
+    }
+
+    function load() {
+      loadDiagnostics();
+      loadCrossTenant();
     }
 
     window.addEventListener('hashchange', () => {

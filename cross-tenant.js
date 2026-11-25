@@ -228,6 +228,9 @@ async function runCrossTenant({ spec, ownUrl, ownKey, token, jit, fetchImpl = (.
   };
 }
 
+// The api-gateway answers this itself, so it does not depend on the target health or on the control.
+const GATEWAY_NOT_ISSUED_MESSAGE = 'Vercel OIDC token not issued for this project';
+
 const is2xx = (status) => status >= 200 && status < 300;
 
 function classify(service, control, target, health) {
@@ -238,6 +241,9 @@ function classify(service, control, target, health) {
   }
   if (s === null) return { result: 'inconclusive', reason: `network error: ${target?.error ?? 'no response'}` };
   if (s >= 500) return { result: 'inconclusive', reason: `HTTP ${s} from the target` };
+  if (s === 401 && target?.error?.includes(GATEWAY_NOT_ISSUED_MESSAGE)) {
+    return { result: 'rejected', reason: `api-gateway rejected the token: ${GATEWAY_NOT_ISSUED_MESSAGE}` };
+  }
   if (!is2xx(health?.status)) {
     return {
       result: 'inconclusive',
@@ -245,7 +251,7 @@ function classify(service, control, target, health) {
     };
   }
   if (!is2xx(control?.status)) {
-    const detail = [control?.status, control?.error].filter((v) => v != null && v !== '').join(' ');
+    const detail = control?.error;
     return {
       result: 'inconclusive',
       reason: `control on this tenant returned ${control?.status ?? control?.error ?? 'no response'}; this tenant does not accept the token for this service either, so a rejection by the target proves nothing${detail ? ` (${detail})` : ''}`,
@@ -276,13 +282,20 @@ function evaluateService(data, service) {
 
 const MGMT_JIT_REJECTIONS = [401, 403, 404];
 
+// The error text can already start with the status (for example "403 bad_jwt: ..."), so it is not repeated.
+function describeStatusAndError(status, error) {
+  const text = error == null ? '' : String(error);
+  if (status == null || status === '') return text;
+  return text.startsWith(String(status)) ? text : [status, text].filter(Boolean).join(' ');
+}
+
 function classifyMgmtJit(control, target) {
   const s = target.status ?? null;
   if (is2xx(s)) return { result: 'accepted' };
   if (s === null) return { result: 'inconclusive', reason: `network error: ${target.error ?? 'no response'}` };
   if (s >= 500) return { result: 'inconclusive', reason: `HTTP ${s} from the Management API` };
   if (!is2xx(control?.status)) {
-    const detail = [control?.status, control?.error ?? control?.skipped].filter((v) => v != null && v !== '').join(' ');
+    const detail = describeStatusAndError(control?.status, control?.error ?? control?.skipped);
     return {
       result: 'inconclusive',
       reason: `the JIT grant for this tenant (jit_management_api) did not succeed, so a rejection of the target proves nothing${detail ? ` (${detail})` : ''}`,

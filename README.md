@@ -19,14 +19,21 @@ Use a Vercel project that has the Supabase Marketplace integration. Then do thes
 
 ## `GET /`
 
-Dashboard ([`dashboard.js`](./dashboard.js)) that calls `/api/diagnostics` and lists every check, grouped,
-colored by status: green = pass, yellow = warning, red = fail, gray = skipped. Click a summary pill to show
-only that status (click it again, or "Overall", to show all); the filter is kept in the URL hash (e.g. `/#fail`).
+Dashboard ([`dashboard.js`](./dashboard.js)) that calls `/api/diagnostics` and `/api/cross-tenant` at the same
+time and lists every check, grouped, colored by status: green = pass, yellow = warning, red = fail, gray = skipped.
+Click a summary pill to show only that status (click it again, or "Overall", to show all); the filter is kept in
+the URL hash (e.g. `/#fail`).
+
+The cross-tenant probes can take up to 20 seconds. The dashboard shows the `/api/diagnostics` checks when that
+response arrives, with a dashed gray "Loading…" row for the `cross_tenant` group. When `/api/cross-tenant` answers
+(the dashboard sends the saved pooler hints), it replaces the row with the `cross_tenant` checks and updates the
+summary pills. If that call fails, the row shows a warning with the error message.
 
 ## `GET /api/diagnostics`
 
 Handled by [`api/diagnostics.js`](./api/diagnostics.js) (a `(req, res)` handler used by `server.js` locally
 and deployable as a Vercel function). Returns JSON (non-secret) shaped as `{ "data": {...}, "checks": {...} }`. Always HTTP 200.
+The response does not have the `cross_tenant` data or checks. See [`GET /api/cross-tenant`](#get-apicross-tenant).
 
 `data` describes the current auth context:
 
@@ -65,8 +72,6 @@ and deployable as a Vercel function). Returns JSON (non-secret) shaped as `{ "da
   host is `<ref>.supabase.co`.
 - `end_user` – when an `Authorization: Bearer <supabase-jwt>` header is sent, the validated user
   (id, email, role, providers) and token claims.
-- `cross_tenant` – the results of the cross-tenant probes and of the control probes on this project.
-  Keys and tokens are not included, and a `2xx` response body is not kept. See [Cross-tenant checks](#cross-tenant-checks).
 - `access` – for each identity, whether known tables (`countries`) can be read, with row counts.
 - `database_identity` – for each identity, the result of the `public.whoami_vercel()` RPC
   (`supabase/migrations/20261118214000_add-whoami_vercel.sql`), i.e. how Supabase resolved the token on the
@@ -99,7 +104,8 @@ with `PGRST301` ("No suitable key or wrong key type").
 
 Each result is `pass`, `warn`, `fail` or `skip` (skipped because an earlier step failed
 or the runtime cannot run the check). `summary.status` is the worst of `fail`, `warn` and `pass`.
-`skip` results do not change `summary.status`.
+`skip` results do not change `summary.status`. `/api/diagnostics` runs all groups except `cross_tenant`.
+`/api/cross-tenant` runs only `cross_tenant`. The `summary` of each response covers only its own checks.
 
 | Group | Checks |
 |---|---|
@@ -143,6 +149,18 @@ CROSS_TENANT_TARGETS="abcdefghijklmnopqrst=sb_publishable_...,https://zyxwvutsrq
 
 `pnpm run bootstrap` can build this list for you. If `CROSS_TENANT_TARGETS` is not set, all cross-tenant checks are skipped. An entry for this deployment's own project ref is a configuration error, because it is not a cross-tenant test.
 
+### `GET /api/cross-tenant`
+
+Handled by [`api/cross-tenant.js`](./api/cross-tenant.js), with the same handler style as `/api/diagnostics`. The probes can take up to 20 seconds, because of the JIT pooler discovery. Because of this, they are not part of `/api/diagnostics`.
+
+The response is `{ "data": {...}, "checks": {...} }`:
+
+- `data.cross_tenant` has the results of the cross-tenant probes and of the control probes on this project. Keys and tokens are not included, and a `2xx` response body is not kept.
+- `data.jit` has `management_api` and `postgres_login`, the two JIT results that the cross-tenant checks use as controls.
+- `checks` has only the `cross_tenant` group. `checks.summary` counts only these checks.
+
+The query parameter `pooler_hints` is a list of `<target ref>:<pooler host>` entries, separated by commas. The pooler check tries these hosts first. The dashboard saves the hosts that answered and sends them on the next load.
+
 The probes are:
 
 | Check | Request | Rejection |
@@ -165,8 +183,9 @@ Each check shows, for each target: the target ref, the gateway version, the cont
 
 - A `2xx` response from another tenant means that the tenant accepted tenant A's token. The check fails with `regression: <service> on <ref> (gateway vN) accepted tenant <A>'s token`.
 - A network error or a `5xx` response is inconclusive. The check warns.
+- A `401` response from a target with the message `Vercel OIDC token not issued for this project` is a definitive rejection by the api-gateway. The result is `rejected` with the reason `api-gateway rejected the token: Vercel OIDC token not issued for this project`, also when the target health check or the control on this tenant fails.
 - Each target also gets `GET /auth/v1/health` with its key as `apikey`. If this is not `2xx`, the target ref or key is not valid in this environment (wrong ref, wrong key, paused project, or a project in the other environment, such as a staging project on a production deployment). A rejection from such a target proves nothing, so the result for that target is inconclusive and the check warns. A `2xx` response to the token is still a regression.
-- The same four probes go to this deployment's own project (own URL and own publishable or anon key) as a positive control. If the control does not return `2xx` for a service, this tenant does not accept the token for that service either, so a rejection by a target proves nothing. The result for that service is inconclusive and the check warns. The REST probe reads the `public.countries` table, which this project creates in its migrations. Auth admin can be inconclusive if Supabase Auth does not accept resource tokens on this tenant. The control error, such as `401 PGRST301: ...`, shows why.
+- The same four probes go to this deployment's own project (own URL and own publishable or anon key) as a positive control. If the control does not return `2xx` for a service, this tenant does not accept the token for that service either, so a rejection by a target proves nothing. The result for that service is inconclusive and the check warns. The REST probe reads the `public.countries` table, which this project creates in its migrations. Auth admin can be inconclusive if Supabase Auth does not accept resource tokens on this tenant. The control error, such as `PGRST301: ...`, shows why.
 
 The gateway version comes from the `sb-gateway-version` response header. The values `1` and `1.0` become `v1`, and `2` and `2.0` become `v2`. If the header is missing, the version is `unknown`. `cross_tenant_gateway_coverage` passes when the targets answered with both `v1` and `v2`, and warns otherwise. The api-gateway v2 does not serve any projects yet. Until it does, no target can answer with `v2`, so this check warns and only `v1` can be checked.
 

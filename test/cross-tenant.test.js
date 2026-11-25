@@ -184,7 +184,7 @@ test('control and target errors keep a safe summary and no secrets', async () =>
   assert.ok(!json.includes(TOKEN) && !json.includes(KEY) && !json.includes('not kept') && !json.includes('nested'));
   const r = await check('cross_tenant_rest', { data });
   assert.equal(r.status, 'warn');
-  assert.match(r.detail, /\(401 PGRST301: JWT rejected <redacted> with <redacted>\)/);
+  assert.match(r.detail, /returned 401;.*\(PGRST301: JWT rejected <redacted> with <redacted>\)/);
   assert.ok(!JSON.stringify(r).includes(TOKEN));
 });
 
@@ -263,4 +263,46 @@ test('never returns the token or a 2xx body', async () => {
   assert.ok(!json.includes('tenant-data') && !json.includes('own-secret-data'));
   const { results } = await require('../checks').runChecks(data, {}, { env: {}, now: () => 0, fetchImpl: () => assert.fail() });
   assert.ok(!JSON.stringify(results).includes(TOKEN));
+});
+
+const GATEWAY_BODY = JSON.stringify({ code: 'unauthorized', message: 'Vercel OIDC token not issued for this project' });
+const GATEWAY_REASON = 'api-gateway rejected the token: Vercel OIDC token not issued for this project';
+
+test('gateway rejection passes when the control fails', async () => {
+  const respond = (ref, service) =>
+    ref === REF
+      ? { status: 403, body: JSON.stringify({ code: 403, error_code: 'bad_jwt', msg: 'rejected' }) }
+      : { status: 401, body: service === 'auth_admin' ? GATEWAY_BODY : '{}' };
+  const { ct, data } = await run({ respond });
+  const row = evaluateRow(ct, 'auth_admin');
+  assert.equal(row.result, 'rejected');
+  assert.equal(row.reason, GATEWAY_REASON);
+  const r = await check('cross_tenant_auth_admin', { data });
+  assert.equal(r.status, 'pass');
+  assert.equal(r.actual[0].reason, GATEWAY_REASON);
+  assert.equal((await check('cross_tenant_rest', { data })).status, 'warn');
+});
+
+test('gateway rejection applies to every service and to a failing target health check', async () => {
+  const respond = (ref) => (ref === REF ? { status: 403 } : { status: 401, body: GATEWAY_BODY });
+  const { ct, data } = await run({ respond, health: () => ({ status: 404 }) });
+  for (const service of SERVICES) {
+    assert.equal(evaluateRow(ct, service).reason, GATEWAY_REASON, service);
+    assert.equal((await check(`cross_tenant_${service}`, { data })).status, 'pass', service);
+  }
+});
+
+test('a plain 401 without the gateway message is still inconclusive when the control fails', async () => {
+  const respond = (ref) => (ref === REF ? { status: 403 } : { status: 401, body: '{"msg":"other"}' });
+  const { ct, data } = await run({ respond });
+  const row = evaluateRow(ct, 'auth_admin');
+  assert.equal(row.result, 'inconclusive');
+  assert.match(row.reason, /control on this tenant returned 403/);
+  assert.equal((await check('cross_tenant_auth_admin', { data })).status, 'warn');
+});
+
+test('the gateway message on a status other than 401 does not count as a gateway rejection', async () => {
+  const respond = (ref) => (ref === REF ? { status: 403 } : { status: 403, body: GATEWAY_BODY });
+  const { ct } = await run({ respond });
+  assert.equal(evaluateRow(ct, 'rest').result, 'inconclusive');
 });
