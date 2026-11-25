@@ -158,7 +158,7 @@ const needJitToken = (c) => {
 };
 
 const JIT_HINT = 'Check that JIT access is enabled: run `pnpm run enable-jit`.';
-const CTRL_2151_HINT = 'Known issue CTRL-2151: the pooler needs `--jit=true`.';
+const CTRL_2151_HINT = 'Known issue CTRL-2151: the pooler needs `--jit=true`. Existing clients send this option, so this is a warning, not a failure.';
 const JIT_ROLE_MISMATCH = 'Token role does not match requested role';
 const JIT_ROLE_HINT = `The token role must equal the requested JIT role. Mint the token with ?role=${JIT_ROLE}.`;
 const jitApiHint = (r) => (r.status === 403 && r.error?.includes(JIT_ROLE_MISMATCH) ? JIT_ROLE_HINT : JIT_HINT);
@@ -814,7 +814,7 @@ const CHECKS = [
       if (r.skipped) return skip(r.skipped);
       if (r.error) {
         const actual = { endpoint: r.endpoint, error: r.error };
-        return fail(expected, actual, isAuthFailure(r) ? CTRL_2151_HINT : undefined);
+        return isAuthFailure(r) ? warn(expected, actual, CTRL_2151_HINT) : fail(expected, actual);
       }
       return r.current_user === JIT_ROLE
         ? pass(expected, { endpoint: r.endpoint, current_user: r.current_user, ms: r.ms }, 'CTRL-2151 may be fixed.')
