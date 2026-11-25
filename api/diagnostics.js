@@ -7,6 +7,7 @@ const {
   ANON_KEY_ENV_VARS,
   CLIENT_OPTIONS,
   makeClient,
+  gatewayClientFactory,
   firstEnv,
   decodeJwt,
   jwtHeader,
@@ -93,13 +94,34 @@ function tamper(token) {
   return token.slice(0, i) + (token[i] === 'A' ? 'B' : 'A') + token.slice(i + 1);
 }
 
-// Control requests that show the role comes from the resource token: without it the request must
-// run as anon, and with a tampered signature Supabase must reject it (401 PGRST301).
-async function runControls(ctx) {
-  const apikeyOnly = makeClient(ctx.apikey);
-  const tampered = makeClient(ctx.apikey, { ...CLIENT_OPTIONS, accessToken: async () => tamper(ctx.resourceToken) });
-  const [apikeyOnlyResult, tamperedResult] = await Promise.all([dbWhoami(apikeyOnly), dbWhoami(tampered)]);
-  return { apikey_only: apikeyOnlyResult, tampered_token: tamperedResult };
+// Runs probe with its own client and records the gateway version of the answer when the client has one.
+async function traced(versions, name, client, probe) {
+  const result = await probe(client);
+  if (client.gatewayVersion) versions[name] = client.gatewayVersion();
+  return result;
+}
+
+// The requests to the project api-gateway. make(key, options) creates each client: makeClient for api-gateway
+// v1, or a gatewayClientFactory client for v2. The controls show that the role comes from the resource token:
+// without it the request must run as anon, and with a tampered signature Supabase must reject it (401 PGRST301).
+async function gatewayProbes(server, make, skipped) {
+  const versions = {};
+  const resourceToken = server.ctx?.resourceToken;
+  const serverClient = () => make(...server.clientArgs);
+  const hasClient = Boolean(SUPABASE_URL_INFO.valid && server.clientArgs?.[0]);
+  const runControls = async () => {
+    const [apikeyOnly, tampered] = await Promise.all([
+      traced(versions, 'apikey_only', make(server.ctx.apikey), dbWhoami),
+      traced(versions, 'tampered_token', make(server.ctx.apikey, { ...CLIENT_OPTIONS, accessToken: async () => tamper(resourceToken) }), dbWhoami),
+    ]);
+    return { apikey_only: apikeyOnly, tampered_token: tampered };
+  };
+  const [access, databaseIdentity, controls] = await Promise.all([
+    hasClient ? traced(versions, 'access', serverClient(), probeAccess) : skipped,
+    hasClient ? traced(versions, 'database_identity', serverClient(), dbWhoami) : skipped,
+    hasClient && resourceToken ? runControls() : skipped,
+  ]);
+  return { access, database_identity: databaseIdentity, controls, gateway_versions: versions };
 }
 
 // The direct host has an A record only with the IPv4 add-on, and always has an AAAA record. Prefer IPv4, fall back to IPv6,
@@ -139,10 +161,10 @@ async function runDiagnostics(req) {
   };
   const noJitToken = noJitTokenResult(jit);
   const directHost = SUPABASE_URL_INFO.project_ref ? `db.${SUPABASE_URL_INFO.host}` : null;
-  const [serverAccess, serverDbIdentity, controls, jitApi, jitApiDefaultRole, jitLogin, jitLoginNoJit, directLogin, endUser] = await Promise.all([
-    server.client ? probeAccess(server.client) : skipped,
-    server.client ? dbWhoami(server.client) : skipped,
-    server.client && resourceToken ? runControls(server.ctx) : skipped,
+  const isOidcPath = server.info.auth_path === 'vercel_oidc_marketplace';
+  const [v1, v2, jitApi, jitApiDefaultRole, jitLogin, jitLoginNoJit, directLogin, endUser] = await Promise.all([
+    gatewayProbes(server, makeClient, skipped),
+    gatewayProbes(server, gatewayClientFactory('v2'), skipped),
     jitToken ? requestJitAccess(jitToken) : noJitToken,
     // Control: the default-role (service_role) token must not get JIT access to JIT_ROLE.
     resourceToken ? requestJitAccess(resourceToken) : noToken,
@@ -162,9 +184,16 @@ async function runDiagnostics(req) {
     },
     server_credential: {
       ...server.info,
-      access: serverAccess,
-      database_identity: serverDbIdentity,
-      ...(server.info.auth_path === 'vercel_oidc_marketplace' && { controls }),
+      access: v1.access,
+      database_identity: v1.database_identity,
+      ...(isOidcPath && { controls: v1.controls }),
+    },
+    // The same requests with sb-forward-traffic: true, and the gateway version that answered each one.
+    gateway_v2: {
+      access: v2.access,
+      database_identity: v2.database_identity,
+      ...(isOidcPath && { controls: v2.controls }),
+      gateway_versions: v2.gateway_versions,
     },
     jit: {
       resource_token: jit.info,

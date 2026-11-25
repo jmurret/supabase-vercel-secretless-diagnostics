@@ -5,6 +5,7 @@ const { runChecks } = require('./checks');
 const { poolerLoginParams } = require('./pooler');
 const { runCrossTenant, runCrossTenantS3 } = require('./cross-tenant');
 const { parsePoolerHints, parseRegionHints } = require('./pooler-discovery');
+const { GATEWAY_HEADER, variantHeaders, normalizeGatewayVersion } = require('./gateway-variants');
 
 const URL_ENV_VAR = ['SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_URL'].find((n) => process.env[n]);
 const SUPABASE_URL = URL_ENV_VAR ? process.env[URL_ENV_VAR].replace(/\/+$/, '') : undefined;
@@ -46,6 +47,26 @@ const SUPABASE_URL_INFO = describeSupabaseUrl();
 
 function makeClient(key, options = CLIENT_OPTIONS) {
   return SUPABASE_URL_INFO.valid && key ? createClient(SUPABASE_URL, key, options) : null;
+}
+
+// Returns a makeClient for api-gateway `variant`. Its clients send the forwarding header of the variant, and
+// client.gatewayVersion() gives the sb-gateway-version of the answers ("unknown" without an answer). Use one
+// client for each probe, so that the version belongs to that probe.
+function gatewayClientFactory(variant, fetchImpl = (...args) => fetch(...args)) {
+  return (key, options = CLIENT_OPTIONS) => {
+    if (!SUPABASE_URL_INFO.valid || !key) return null;
+    const versions = new Set();
+    const recordingFetch = async (...args) => {
+      const res = await fetchImpl(...args);
+      versions.add(normalizeGatewayVersion(res.headers.get(GATEWAY_HEADER)));
+      return res;
+    };
+    const client = createClient(SUPABASE_URL, key, {
+      ...options,
+      global: { ...options.global, headers: { ...options.global?.headers, ...variantHeaders(variant) }, fetch: recordingFetch },
+    });
+    return Object.assign(client, { gatewayVersion: () => [...versions].sort().join(',') || 'unknown' });
+  };
 }
 
 function firstEnv(names) {
@@ -181,13 +202,14 @@ async function resolveServerCredential(req) {
     };
     if (!resourceId) {
       info.resource_token.error = 'MARKETPLACE_RESOURCE_ID is not set';
-      return { client: null, info, ctx: { oidcToken: oidc.token }, error: new MintError(info.resource_token.error) };
+      return { clientArgs: null, info, ctx: { oidcToken: oidc.token }, error: new MintError(info.resource_token.error) };
     }
     const { token, fields, error } = await mintAndDescribe(resourceId, oidc.token);
     Object.assign(info.resource_token, fields);
-    if (!token) return { client: null, info, ctx: { oidcToken: oidc.token }, error };
+    if (!token) return { clientArgs: null, info, ctx: { oidcToken: oidc.token }, error };
     return {
-      client: makeClient(anonKey?.value, { ...CLIENT_OPTIONS, accessToken: async () => token }),
+      // Arguments of makeClient (or of a gatewayClientFactory client) for the server client.
+      clientArgs: [anonKey?.value, { ...CLIENT_OPTIONS, accessToken: async () => token }],
       info,
       // Raw tokens/keys for probes and checks.js signature/size checks; never serialized.
       ctx: { oidcToken: oidc.token, resourceToken: token, apikey: anonKey?.value },
@@ -195,7 +217,7 @@ async function resolveServerCredential(req) {
   }
   const key = firstEnv(KEY_ENV_VARS);
   return {
-    client: makeClient(key?.value),
+    clientArgs: [key?.value],
     info: {
       auth_path: 'vercel_integration_keys',
       key_env_var: key?.name ?? null,
@@ -353,6 +375,7 @@ module.exports = {
   ANON_KEY_ENV_VARS,
   CLIENT_OPTIONS,
   makeClient,
+  gatewayClientFactory,
   firstEnv,
   decodeJwt,
   jwtHeader,

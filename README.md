@@ -77,6 +77,11 @@ The response does not have the `cross_tenant` data or checks. See [`GET /api/cro
   `postgres_login_no_jit` is the same login without the option. `direct_login` logs in as `postgres`
   to `db.<project host>`. It uses the IPv4 address when the host has one (Supabase IPv4 add-on),
   and the IPv6 address otherwise. See [Enable JIT by hand](#enable-jit-by-hand-temporary).
+- `gateway_v2` – the requests of `server_credential` that go through the project api-gateway (`access`,
+  `database_identity` and, on the OIDC path, `controls`), sent again with the header `sb-forward-traffic: true`.
+  The results have the same form as in `server_credential`. `gateway_versions` has, for each request, the
+  gateway version from the `sb-gateway-version` response header (`v1`, `v2` or `unknown`). See
+  [api-gateway v1 and v2](#api-gateway-v1-and-v2).
 - `environment.supabase_url` – whether `SUPABASE_URL` is set and valid, and the project ref when the
   host is `<ref>.supabase.co`.
 - `end_user` – when an `Authorization: Bearer <supabase-jwt>` header is sent, the validated user
@@ -120,13 +125,21 @@ or the runtime cannot run the check). `summary.status` is the worst of `fail`, `
 | Group | Checks |
 |---|---|
 | `config` | `supabase_url`, `apikey_public` (no secret/service-role key in the `apikey` header), `resource_id` (`store_…` / `ir_…`), `pooler_host` (`POSTGRES_POOLER_HOST` is a host name only and contains `.pooler.`), `project_ref` (`SUPABASE_PROJECT_REF` is 20 lowercase letters and equals the ref in `SUPABASE_URL`) |
-| `path` | `auth_path` (OIDC path in use), `no_static_secret` (fail if `POSTGRES_URL`, `POSTGRES_PRISMA_URL`, `POSTGRES_URL_NON_POOLING` or `POSTGRES_PASSWORD` is set; warn if a service-role/secret key or `SUPABASE_JWT_SECRET` is set, under any env var name; reports env var names only) |
+| `path` | `auth_path` (OIDC path in use), `gateway_v2_forwarding` (every request with `sb-forward-traffic: true` was answered by api-gateway v2; warns otherwise, for example on a staging deployment without forwarding), `no_static_secret` (fail if `POSTGRES_URL`, `POSTGRES_PRISMA_URL`, `POSTGRES_URL_NON_POOLING` or `POSTGRES_PASSWORD` is set; warn if a service-role/secret key or `SUPABASE_JWT_SECRET` is set, under any env var name; reports env var names only) |
 | `vercel_oidc` | `oidc_present`, `oidc_iss`, `oidc_alg_kid` (RS256 + kid), `oidc_not_expired`, `oidc_owner_project`, `oidc_team` (`VERCEL_TEAM_ID`, if set, = `owner_id`) |
 | `mint` | `mint_ok` (with hints for spec error codes such as `resource_oidc_not_enabled`) |
 | `resource_token` | `resource_alg_kid`, `resource_required_claims` (aud, sub, act, iat, nbf, exp), `resource_iss`, `resource_aud`, `resource_sub`, `resource_sub_project` (sub = project ref in `SUPABASE_URL`), `resource_role` (`service_role`), `resource_act` (act.sub = deployment OIDC sub), `resource_environment`, `resource_time` (60 s tolerance), `resource_lifetime` (≤ 15 min), `resource_size` (≤ 4 KB), `resource_signature` (verified against `<iss>/jwks.json`) |
-| `database` | `db_accepted` (PGRST301 → add the issuer as a Custom OIDC third-party provider), `db_role` (runs as `service_role`), `db_claims_match`, `db_rls_bypass` (`service_role` bypasses RLS), `db_table_access`, `db_anon_control` (apikey only → `anon`), `db_tampered_rejected` (tampered token → `401 PGRST301`) |
+| `database` | `db_accepted` (PGRST301 → add the issuer as a Custom OIDC third-party provider), `db_role` (runs as `service_role`), `db_claims_match`, `db_rls_bypass` (`service_role` bypasses RLS), `db_table_access`, `db_anon_control` (apikey only → `anon`), `db_tampered_rejected` (tampered token → `401 PGRST301`). Each check runs on api-gateway v1 and v2. |
 | `jit` | `jit_token_role` (the token minted with `?role=postgres` has the role `postgres`), `jit_management_api` (Management API grants JIT access), `jit_default_role_rejected` (Management API rejects JIT access for the default-role token with `403 Token role does not match requested role`), `jit_postgres_login` (pooler login to `POSTGRES_POOLER_HOST:6543` as `postgres.<SUPABASE_PROJECT_REF>` with the JIT token and `--jit=true` runs as `postgres`), `jit_postgres_login_no_jit` (pooler login without `--jit=true`; this check fails until CTRL-2151 is done), `jit_direct_login` (direct login runs as `postgres`; uses the IPv4 address when the host has one, else IPv6; skipped when the host has only an IPv6 address and the runtime has no IPv6 route) |
 | `cross_tenant` | `cross_tenant_targets` (`CROSS_TENANT_TARGETS` entries are valid and are other tenants), `cross_tenant_rest`, `cross_tenant_auth_admin`, `cross_tenant_storage`, `cross_tenant_realtime`, `cross_tenant_storage_s3`, `cross_tenant_realtime_ws` (other tenants reject this tenant's resource token), `cross_tenant_mgmt_jit` (the Management API does not grant JIT access to another tenant for this tenant's JIT token), `cross_tenant_pooler_login` (the pooler of another tenant does not accept a login as `postgres.<target ref>` with this tenant's JIT token and `--jit=true`), `cross_tenant_gateway_coverage` (for each target, the v1 requests reached api-gateway `v1` and the v2 requests reached api-gateway `v2`). See [Cross-tenant checks](#cross-tenant-checks). |
+
+### api-gateway v1 and v2 in `/api/diagnostics`
+
+api-gateway v1 forwards a request with the header `sb-forward-traffic` to api-gateway v2 (see [api-gateway v1 and v2](#api-gateway-v1-and-v2)). The `database` checks use requests to the project api-gateway, so `/api/diagnostics` sends each of these requests twice: once without the header (`v1`, results in `server_credential`) and once with `sb-forward-traffic: true` (`v2`, results in `gateway_v2`).
+
+Each `database` check runs on the `v1` results and on the `v2` results. If the `sb-gateway-version` header of a `v2` request that the check uses is not `v2`, the `v2` result is a warning with the detail `request was not forwarded to api-gateway v2`. The status of the check is the worst of the two results: `fail`, then `warn`, then `pass`. The check is skipped only when both results are skipped. The detail shows the two results, for example `v1 pass, v2 warn (request was not forwarded to api-gateway v2)`. `actual` is `{ "v1": ..., "v2": ... }`, and `variants` has the full `v1` and `v2` results.
+
+The checks that do not use the project api-gateway do not change: the Vercel OIDC token, the mint, the resource token claims, the Management API JIT requests and the Postgres logins. `end_user` (sent only with an `Authorization` header) is not sent to v2, because no check uses it.
 
 The Supabase integration syncs these non-secret Postgres env vars to the Vercel project. The pooler checks use them:
 

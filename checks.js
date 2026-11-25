@@ -3,7 +3,7 @@ const { RESYNC_HINT } = require('./pooler');
 const {
   SERVICES: CROSS_TENANT_SERVICES, JIT_PROBES, evaluateService, describeVariants, evaluateJitProbe, gatewayCoverage,
 } = require('./cross-tenant');
-const { FORWARD_HEADER } = require('./gateway-variants');
+const { FORWARD_HEADER, VARIANTS, NOT_FORWARDED, isForwarded, worstStatus } = require('./gateway-variants');
 
 // Expectations from "Vercel Marketplace OIDC" (Vercel OIDC secretless spec, Nov 18).
 const SPEC = 'Vercel Marketplace OIDC (spec updated Nov 18)';
@@ -133,6 +133,7 @@ function buildContext(data, ctx, env, nowMs) {
     jit: data.jit ?? null,
     crossTenant: data.cross_tenant ?? null,
     crossTenantS3: data.cross_tenant_s3 ?? null,
+    gatewayV2: data.gateway_v2 ?? null,
   };
 }
 
@@ -607,8 +608,22 @@ const CHECKS = [
     },
   },
   {
+    id: 'gateway_v2_forwarding',
+    group: 'path',
+    description: `Requests with the ${FORWARD_HEADER} header reach api-gateway v2 (from the sb-gateway-version response header)`,
+    run: (c) => {
+      const versions = c.gatewayV2?.gateway_versions;
+      if (!versions || !Object.keys(versions).length) return skip('No api-gateway v2 requests were sent.');
+      const missed = Object.entries(versions).filter(([, version]) => !isForwarded('v2', version));
+      if (!missed.length) return pass('v2', versions);
+      return warn('v2', versions,
+        `Not forwarded to api-gateway v2: ${missed.map(([name, version]) => `${name} (answered by ${version})`).join(', ')}. The v2 results of the database checks are inconclusive. Staging can have no forwarding configured.`);
+    },
+  },
+  {
     id: 'db_accepted',
     group: 'database',
+    gateway: ['database_identity'],
     description: 'Supabase accepted the resource token',
     run: (c) => {
       const s = needDb(c);
@@ -626,6 +641,7 @@ const CHECKS = [
   {
     id: 'db_role',
     group: 'database',
+    gateway: ['database_identity'],
     description: `Database request runs as "${EXPECTED_ROLE}"`,
     run: (c) => {
       const s = needDb(c);
@@ -639,6 +655,7 @@ const CHECKS = [
   {
     id: 'db_claims_match',
     group: 'database',
+    gateway: ['database_identity'],
     description: 'Claims seen by the database match the minted token (iss, sub, aud, role)',
     run: (c) => {
       const s = needDb(c);
@@ -655,6 +672,7 @@ const CHECKS = [
   {
     id: 'db_rls_bypass',
     group: 'database',
+    gateway: ['database_identity'],
     description: `Database role ${EXPECTED_BYPASS_RLS ? 'bypasses' : 'does not bypass'} RLS, as expected for "${EXPECTED_ROLE}"`,
     run: (c) => {
       const s = needDb(c);
@@ -668,6 +686,7 @@ const CHECKS = [
   {
     id: 'db_table_access',
     group: 'database',
+    gateway: ['access'],
     description: 'Probe tables (public.countries) can be read with the resource token',
     run: (c) => {
       const s = needResource(c);
@@ -684,6 +703,7 @@ const CHECKS = [
   {
     id: 'db_anon_control',
     group: 'database',
+    gateway: ['apikey_only', 'database_identity'],
     description: 'Control: without the resource token (apikey only) the request runs as anon',
     run: (c) => {
       const s = needDb(c);
@@ -703,6 +723,7 @@ const CHECKS = [
   {
     id: 'db_tampered_rejected',
     group: 'database',
+    gateway: ['tampered_token'],
     description: 'Control: Supabase rejects the resource token with a tampered signature (401 PGRST301)',
     run: (c) => {
       const s = needResource(c);
@@ -854,6 +875,45 @@ const CHECKS = [
   },
 ];
 
+async function runOne(check, c, deps) {
+  try {
+    return await check.run(c, deps);
+  } catch (err) {
+    return fail(null, null, `Check errored: ${err.message}`);
+  }
+}
+
+// The v2 context replaces the api-gateway results with the results of the requests sent to api-gateway v2.
+const v2Context = (c) => ({
+  ...c,
+  sc: { ...c.sc, access: c.gatewayV2.access },
+  db: c.gatewayV2.database_identity ?? null,
+  controls: c.gatewayV2.controls ?? null,
+});
+
+const describeOutcome = (variant, r) => `${variant} ${r.status}${r.detail ? ` (${r.detail})` : ''}`;
+
+// A check with `gateway` (the names of its requests in gateway_v2.gateway_versions) runs on the v1 results and on
+// the v2 results. A v2 result is inconclusive when api-gateway v2 did not answer one of its requests. The status
+// is the worst of the two: fail, then warn, then pass, then skip.
+async function runOnGateways(check, c, deps) {
+  const outcomes = { v1: await runOne(check, c, deps) };
+  outcomes.v2 = c.gatewayV2 ? await runOne(check, v2Context(c), deps) : skip('api-gateway v2 requests were not run.');
+  if (outcomes.v2.status !== 'skip') {
+    const versions = check.gateway.map((name) => c.gatewayV2.gateway_versions?.[name] ?? 'unknown');
+    if (versions.some((version) => !isForwarded('v2', version))) outcomes.v2 = warn(outcomes.v2.expected, outcomes.v2.actual, NOT_FORWARDED);
+  }
+  const statuses = VARIANTS.map((v) => outcomes[v].status);
+  if (statuses.every((s) => s === 'skip')) return { ...outcomes.v1, variants: outcomes };
+  return {
+    status: worstStatus(statuses),
+    expected: outcomes.v1.expected ?? outcomes.v2.expected,
+    actual: Object.fromEntries(VARIANTS.map((v) => [v, outcomes[v].actual])),
+    detail: VARIANTS.map((v) => describeOutcome(v, outcomes[v])).join(', '),
+    variants: outcomes,
+  };
+}
+
 // include and exclude are lists of group names and check ids. The summary covers only the checks that ran.
 async function runChecks(data, ctx, { env = process.env, now = Date.now, fetchImpl = fetch, include, exclude } = {}) {
   const c = buildContext(data, ctx, env, now());
@@ -861,12 +921,7 @@ async function runChecks(data, ctx, { env = process.env, now = Date.now, fetchIm
   const matches = (list, check) => list.includes(check.group) || list.includes(check.id);
   const selected = CHECKS.filter((check) => (!include || matches(include, check)) && !(exclude && matches(exclude, check)));
   for (const check of selected) {
-    let outcome;
-    try {
-      outcome = await check.run(c, { fetchImpl });
-    } catch (err) {
-      outcome = fail(null, null, `Check errored: ${err.message}`);
-    }
+    const outcome = check.gateway ? await runOnGateways(check, c, { fetchImpl }) : await runOne(check, c, { fetchImpl });
     results.push({ id: check.id, group: check.group, description: check.description, ...outcome });
   }
   const count = (st) => results.filter((r) => r.status === st).length;
