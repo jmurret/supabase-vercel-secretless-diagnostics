@@ -404,6 +404,16 @@ legacy_anon_key() {
       } catch {}
     ' "$1" || true
 }
+publishable_key() {
+  curl -s --max-time 15 -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" "$mgmt/v1/projects/$1/api-keys" 2>/dev/null |
+    node -e '
+      try {
+        const keys = JSON.parse(require("fs").readFileSync(0, "utf8"));
+        const k = (Array.isArray(keys) ? keys : []).find((k) => k.type === "publishable" && /^sb_publishable_[A-Za-z0-9_-]+$/.test(k.api_key ?? ""));
+        if (k) process.stdout.write(k.api_key);
+      } catch {}
+    ' || true
+}
 is_legacy_anon_key() {
   printf '%s' "$1" | node -e '
     try {
@@ -456,7 +466,13 @@ else
       echo "$t_ref is already entered." >&2
       continue
     fi
-    read -r -p "Publishable key for $t_ref: " t_key || t_key=""
+    t_key=""
+    [ -z "$SUPABASE_ACCESS_TOKEN" ] || t_key="$(publishable_key "$t_ref")"
+    if [ -n "$t_key" ]; then
+      echo "Found the publishable key for $t_ref." >&2
+    else
+      read -r -p "Publishable key for $t_ref: " t_key || t_key=""
+    fi
     if [ -z "$t_key" ]; then
       echo "The publishable key is required." >&2
       continue
