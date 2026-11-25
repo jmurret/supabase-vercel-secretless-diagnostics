@@ -1,6 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { POOLER_REGIONS, poolerRegion, candidateHosts, parsePoolerHints, findTargetPooler } = require('../pooler-discovery');
+const { POOLER_REGIONS, poolerRegion, candidateHosts, parsePoolerHints, parseRegionHints, findTargetPooler } = require('../pooler-discovery');
+
+test('parseRegionHints keeps only known regions for well-formed refs', () => {
+  assert.deepEqual(parseRegionHints('abc:eu-west-2, def:ap-southeast-1'), { abc: 'eu-west-2', def: 'ap-southeast-1' });
+  assert.deepEqual(parseRegionHints('abc:us-east-9,Bad!:us-east-1,ghi:us-east-1:x,jkl:,:us-east-1,mno'), {});
+  assert.deepEqual(parseRegionHints(undefined), {});
+  assert.ok(POOLER_REGIONS.every((region) => parseRegionHints(`abc:${region}`).abc === region));
+});
 
 test('poolerRegion reads the region from a pooler host', () => {
   assert.equal(poolerRegion('aws-0-ap-southeast-1.pooler.supabase.com'), 'ap-southeast-1');

@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { runCrossTenant, evaluateService, SERVICES } = require('../cross-tenant');
+const { runCrossTenant, runCrossTenantS3, evaluateService, SERVICES } = require('../cross-tenant');
 const { signRequest } = require('../sigv4');
 const { REF, oidcData, check, fakeRealtime } = require('./helpers');
 
@@ -32,24 +32,31 @@ function stubFetch({ s3 = (ref) => (ref === REF ? { status: 200 } : DENIED), hea
   return { fetchImpl, calls };
 }
 
-async function run({ s3, health, ws, spec = `${OTHER}=${OTHER_KEY}`, ownKey = OWN_KEY, token = TOKEN, ...rest } = {}) {
+const poolerHost = (region) => `aws-0-${region}.pooler.supabase.com`;
+
+// ct is { cross_tenant, cross_tenant_s3 }: the websocket probe runs in runCrossTenant, S3 in runCrossTenantS3.
+async function run({
+  s3,
+  health,
+  ws,
+  spec = `${OTHER}=${OTHER_KEY}`,
+  ownKey = OWN_KEY,
+  token = TOKEN,
+  regions = { [OTHER]: 'us-east-1' },
+  ownPoolerHost = poolerHost('us-east-1'),
+  ...rest
+} = {}) {
   const { fetchImpl, calls } = stubFetch({ s3, health });
   const realtime = fakeRealtime(ws);
-  const ct = await runCrossTenant({
-    spec,
-    ownUrl: OWN_URL,
-    ownKey,
-    token,
-    fetchImpl,
-    createClientImpl: realtime.createClientImpl,
-    realtimeTimeoutMs: 30,
-    now: () => NOW,
-    ...rest,
-  });
-  return { ct, calls, clients: realtime.clients, data: oidcData({ cross_tenant: ct }) };
+  const common = { spec, ownUrl: OWN_URL, ownKey, token, fetchImpl, ...rest };
+  const ct = {
+    cross_tenant: await runCrossTenant({ ...common, createClientImpl: realtime.createClientImpl, realtimeTimeoutMs: 30, ...rest }),
+    cross_tenant_s3: await runCrossTenantS3({ ...common, regions, ownPoolerHost, now: () => NOW }),
+  };
+  return { ct, calls, clients: realtime.clients, data: oidcData(ct) };
 }
 
-const rowOf = (ct, id) => evaluateService(ct, SERVICES.find((s) => s.id === id)).rows[0];
+const rowOf = (ct, id) => evaluateService(id === 'storage_s3' ? ct.cross_tenant_s3 : ct.cross_tenant, SERVICES.find((s) => s.id === id)).rows[0];
 const s3Calls = (calls, ref) => calls.filter((c) => new URL(c.url).pathname === '/storage/v1/s3/' && refOf(c.url) === ref);
 
 test('S3 sends a signed ListBuckets with the target ref, the target key and the token as session token', async () => {
@@ -98,24 +105,65 @@ test('S3 v2 request signs the forwarding header with the other headers', async (
   assert.equal(s3Calls(calls, REF).filter((c) => c.init.headers['sb-forward-traffic'] === 'true').length, 1);
 });
 
-test('S3 region: target pooler cache, then hint, then own pooler host, then us-east-1', async () => {
-  const hosts = (r) => `aws-0-${r}.pooler.supabase.com`;
-  const regionOf = (ct) => [rowOf(ct, 'storage_s3').region, rowOf(ct, 'storage_s3').region_source];
-  const none = await run();
-  assert.deepEqual(regionOf(none.ct), ['us-east-1', 'default']);
-  assert.equal(rowOf(none.ct, 'storage_s3').control_region, 'us-east-1');
-  const own = await run({ ownPoolerHost: hosts('ap-southeast-1') });
-  assert.deepEqual(regionOf(own.ct), ['ap-southeast-1', 'own_pooler_host']);
-  assert.equal(rowOf(own.ct, 'storage_s3').control_region_source, 'own_pooler_host');
-  const hint = await run({ ownPoolerHost: hosts('ap-southeast-1'), jit: { poolerHints: { [OTHER]: hosts('eu-west-2') } } });
-  assert.deepEqual(regionOf(hint.ct), ['eu-west-2', 'target_pooler_hint']);
-  const cache = await run({
-    ownPoolerHost: hosts('ap-southeast-1'),
-    jit: { poolerHints: { [OTHER]: hosts('eu-west-2') }, poolerCache: new Map([[OTHER, hosts('us-west-1')]]) },
+test('S3 region: the target region from regions, the control region from POSTGRES_POOLER_HOST', async () => {
+  const { ct, calls } = await run({ regions: { [OTHER]: 'eu-west-2' }, ownPoolerHost: poolerHost('ap-southeast-1') });
+  const row = rowOf(ct, 'storage_s3');
+  assert.deepEqual([row.region, row.region_source, row.control_region, row.control_region_source], ['eu-west-2', 'regions', 'ap-southeast-1', 'own_pooler_host']);
+  assert.equal(ct.cross_tenant_s3.targets[0].region, 'eu-west-2');
+  assert.equal(ct.cross_tenant_s3.own.region, 'ap-southeast-1');
+  assert.ok(s3Calls(calls, OTHER).every((c) => /Credential=[^,]*\/eu-west-2\/s3\/aws4_request/.test(c.init.headers.authorization)));
+  assert.ok(s3Calls(calls, REF).every((c) => /Credential=[^,]*\/ap-southeast-1\/s3\/aws4_request/.test(c.init.headers.authorization)));
+});
+
+test('S3: a target without a region is not probed and is inconclusive, never signed for us-east-1', async () => {
+  const { ct, calls, data } = await run({ regions: {} });
+  assert.equal(s3Calls(calls, OTHER).length, 0);
+  // One health check from each of runCrossTenant and runCrossTenantS3.
+  assert.equal(calls.filter((c) => refOf(c.url) === OTHER && new URL(c.url).pathname === '/auth/v1/health').length, 2);
+  const row = rowOf(ct, 'storage_s3');
+  assert.equal(row.result, 'inconclusive');
+  assert.deepEqual([row.variants.v1.reason, row.variants.v2.reason], ['target region unknown', 'target region unknown']);
+  assert.equal(ct.cross_tenant_s3.targets[0].region, null);
+  const r = await check(S3_ID, { data });
+  assert.equal(r.status, 'warn');
+  assert.equal(r.detail, `Inconclusive: ${OTHER}: v1 inconclusive (target region unknown), v2 inconclusive (target region unknown)`);
+});
+
+test('S3: a region for a ref that is not a target is ignored', async () => {
+  const { ct, calls } = await run({ regions: { [OTHER]: 'us-east-1', qwertyuiopasdfghjklz: 'eu-west-1' } });
+  assert.deepEqual(ct.cross_tenant_s3.ignored_regions, ['qwertyuiopasdfghjklz']);
+  assert.ok(calls.every((c) => refOf(c.url) !== 'qwertyuiopasdfghjklz'));
+});
+
+test('S3: without a region for this tenant the control is not sent and the result is inconclusive', async () => {
+  const { ct, calls, data } = await run({ ownPoolerHost: 'pooler.example.com' });
+  assert.equal(s3Calls(calls, REF).length, 0);
+  assert.equal(rowOf(ct, 'storage_s3').variants.v1.control_error, 'the region of this tenant is unknown: POSTGRES_POOLER_HOST does not name one');
+  const r = await check(S3_ID, { data });
+  assert.equal(r.status, 'warn');
+  assert.match(r.detail, /control on this tenant returned the region of this tenant is unknown/);
+});
+
+test('/api/cross-tenant does not run S3 and returns the target pooler region', async () => {
+  const { ct } = await run({ regions: {} });
+  assert.equal('storage_s3' in ct.cross_tenant.targets[0].probes, false);
+  assert.equal('storage_s3' in ct.cross_tenant.own.control, false);
+  const jit = await runCrossTenant({
+    spec: `${OTHER}=${OTHER_KEY}`,
+    ownUrl: OWN_URL,
+    ownKey: OWN_KEY,
+    token: TOKEN,
+    fetchImpl: stubFetch().fetchImpl,
+    createClientImpl: fakeRealtime().createClientImpl,
+    jit: {
+      token: 'jit.token.value',
+      poolerHost: poolerHost('us-east-1'),
+      poolerCache: new Map(),
+      requestJit: async () => ({ status: 403 }),
+      loginPooler: async (ref, host) => (host === poolerHost('eu-west-2') ? { error: 'password authentication failed', code: '28P01' } : { error: 'Tenant or user not found' }),
+    },
   });
-  assert.deepEqual(regionOf(cache.ct), ['us-west-1', 'target_pooler_cache']);
-  assert.match(s3Calls(cache.calls, OTHER)[0].init.headers.authorization, /Credential=[^,]*\/us-west-1\/s3\/aws4_request/);
-  assert.match(s3Calls(cache.calls, REF)[0].init.headers.authorization, /Credential=[^,]*\/ap-southeast-1\/s3\/aws4_request/);
+  assert.deepEqual([jit.targets[0].jit_pooler.pooler_host, jit.targets[0].jit_pooler.region], [poolerHost('eu-west-2'), 'eu-west-2']);
 });
 
 test('S3: AccessDenied from the target with a good control passes and shows the S3 code', async () => {
@@ -213,20 +261,11 @@ test('S3: errors never keep the token or the key', async () => {
   assert.ok(!JSON.stringify(thrown.ct).includes(TOKEN));
 });
 
-test('S3 is part of gateway coverage and the websocket probe is not', async () => {
-  const { data } = await run();
+test('S3 and the websocket probe are not part of gateway coverage', async () => {
+  const { data } = await run({ s3: () => new Error('no answer') });
   const r = await check('cross_tenant_gateway_coverage', { data });
   assert.equal(r.status, 'pass');
-  const noS3Header = async (url, init) => {
-    const { pathname } = new URL(url);
-    const variant = init?.headers?.['sb-forward-traffic'] ? 'v2' : 'v1';
-    const headers = pathname === '/storage/v1/s3/' ? {} : { 'sb-gateway-version': variant === 'v2' ? '2' : '1' };
-    return new Response('{}', { status: refOf(url) === REF || pathname === '/auth/v1/health' ? 200 : 401, headers });
-  };
-  const ct = await runCrossTenant({ spec: `${OTHER}=${OTHER_KEY}`, ownUrl: OWN_URL, ownKey: OWN_KEY, token: TOKEN, fetchImpl: noS3Header, createClientImpl: fakeRealtime().createClientImpl, realtimeTimeoutMs: 30 });
-  const w = await check('cross_tenant_gateway_coverage', { data: oidcData({ cross_tenant: ct }) });
-  assert.equal(w.status, 'warn');
-  assert.deepEqual(w.actual[0], { target: OTHER, v1: ['unknown', 'v1'], v2: ['unknown', 'v2'], missing: ['v1', 'v2'] });
+  assert.deepEqual(r.actual[0], { target: OTHER, v1: ['v1'], v2: ['v2'], missing: [] });
 });
 
 test('the websocket probe sends one join per tenant, without a v2 variant', async () => {

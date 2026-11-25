@@ -54,7 +54,7 @@ test('control error detail does not repeat the status', async () => {
   assert.ok(!row.reason.includes('403 403'));
 });
 
-function loadHandler(name, spy) {
+function loadHandler(name, spy, s3Spy = spyRunCrossTenant()) {
   const stubs = {
     '@supabase/supabase-js': { createClient: () => ({}) },
     '@vercel/functions/oidc': { getVercelOidcToken: async () => null },
@@ -62,17 +62,20 @@ function loadHandler(name, spy) {
   };
   const realLoad = Module._load;
   const realRun = crossTenant.runCrossTenant;
+  const realRunS3 = crossTenant.runCrossTenantS3;
   const paths = ['../diagnostics-core', `../api/${name}`].map((p) => require.resolve(p));
   Module._load = function (request, ...rest) {
     return request in stubs ? stubs[request] : realLoad.call(this, request, ...rest);
   };
   crossTenant.runCrossTenant = spy;
+  crossTenant.runCrossTenantS3 = s3Spy;
   paths.forEach((p) => delete require.cache[p]);
   try {
     return require(paths[1]);
   } finally {
     Module._load = realLoad;
     crossTenant.runCrossTenant = realRun;
+    crossTenant.runCrossTenantS3 = realRunS3;
     paths.forEach((p) => delete require.cache[p]);
   }
 }
@@ -127,7 +130,38 @@ test('/api/cross-tenant returns only the cross_tenant group', async () => {
   assert.deepEqual(res.body.data.cross_tenant, { skipped: 'spy' });
   const { results, summary } = res.body.checks;
   assert.ok(results.length > 0 && results.every(isCrossTenant));
+  assert.ok(!results.some((r) => r.id === 'cross_tenant_storage_s3'));
   assert.equal(summary.passed + summary.warned + summary.failed + summary.skipped, results.length);
+});
+
+test('/api/cross-tenant-s3 runs only the S3 probes and returns only the storage_s3 check', async () => {
+  const spy = spyRunCrossTenant();
+  const s3Spy = spyRunCrossTenant();
+  const res = await call(loadHandler('cross-tenant-s3', spy, s3Spy), '/api/cross-tenant-s3');
+  assert.equal(res.status, 200);
+  assert.equal(spy.calls.length, 0);
+  assert.equal(s3Spy.calls.length, 1);
+  assert.deepEqual(res.body.data, { cross_tenant_s3: { skipped: 'spy' } });
+  assert.deepEqual(res.body.checks.results.map((r) => [r.id, r.group, r.status]), [['cross_tenant_storage_s3', 'cross_tenant', 'skip']]);
+  assert.equal(res.body.checks.summary.skipped, 1);
+});
+
+test('/api/cross-tenant-s3 keeps only known regions and well-formed refs', async () => {
+  const s3Spy = spyRunCrossTenant();
+  const realHost = process.env.POSTGRES_POOLER_HOST;
+  process.env.POSTGRES_POOLER_HOST = 'aws-0-ap-southeast-1.pooler.supabase.com';
+  try {
+    const query = `${OTHER}:eu-west-2,qwertyuiopasdfghjklz:mars-east-1,Bad_Ref:us-east-1,abc:us-east-1:extra,def:`;
+    await call(loadHandler('cross-tenant-s3', spyRunCrossTenant(), s3Spy), `/api/cross-tenant-s3?regions=${encodeURIComponent(query)}`);
+  } finally {
+    if (realHost === undefined) delete process.env.POSTGRES_POOLER_HOST;
+    else process.env.POSTGRES_POOLER_HOST = realHost;
+  }
+  assert.deepEqual(s3Spy.calls[0].regions, { [OTHER]: 'eu-west-2' });
+  assert.equal(s3Spy.calls[0].ownPoolerHost, 'aws-0-ap-southeast-1.pooler.supabase.com');
+  const none = spyRunCrossTenant();
+  await call(loadHandler('cross-tenant-s3', spyRunCrossTenant(), none), '/api/cross-tenant-s3');
+  assert.deepEqual(none.calls[0].regions, {});
 });
 
 test('/api/cross-tenant passes pooler_hints to the probes', async () => {
@@ -150,8 +184,8 @@ test('/api/cross-tenant passes pooler_hints to the probes', async () => {
   assert.deepEqual(spy.calls[0].jit.poolerHints, { [OTHER]: 'pooler.example.com' });
 });
 
-test('both endpoints accept only GET', async () => {
-  for (const name of ['diagnostics', 'cross-tenant']) {
+test('the endpoints accept only GET', async () => {
+  for (const name of ['diagnostics', 'cross-tenant', 'cross-tenant-s3']) {
     const res = await call(loadHandler(name, spyRunCrossTenant()), `/api/${name}`, { method: 'POST' });
     assert.equal(res.status, 405, name);
   }

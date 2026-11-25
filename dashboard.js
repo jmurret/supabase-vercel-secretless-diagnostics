@@ -53,7 +53,7 @@ module.exports = `<!DOCTYPE html>
   </header>
   <main id="checks"><p class="meta">Loading…</p></main>
   <details>
-    <summary>Raw responses (<a href="/api/diagnostics">/api/diagnostics</a>, <a href="/api/cross-tenant">/api/cross-tenant</a>)</summary>
+    <summary>Raw responses (<a href="/api/diagnostics">/api/diagnostics</a>, <a href="/api/cross-tenant">/api/cross-tenant</a>, <a href="/api/cross-tenant-s3">/api/cross-tenant-s3</a>)</summary>
     <pre id="raw"></pre>
   </details>
   <script>
@@ -62,10 +62,15 @@ module.exports = `<!DOCTYPE html>
     const CROSS_TENANT_PLACEHOLDER = {
       id: 'cross_tenant', group: 'cross_tenant', description: 'Cross-tenant checks', status: 'pending', detail: 'Loading…', placeholder: true,
     };
+    const S3_PLACEHOLDER = {
+      id: 'cross_tenant_storage_s3', group: 'cross_tenant', description: 'Storage S3 on other tenants', status: 'pending',
+      detail: 'Loading… (waiting for target region)', placeholder: true,
+    };
     let results = [];
     let diagnosticsResults = null;
     let crossTenantResults = [CROSS_TENANT_PLACEHOLDER];
-    const raw = { diagnostics: null, cross_tenant: null };
+    let s3Results = [S3_PLACEHOLDER];
+    const raw = { diagnostics: null, cross_tenant: null, cross_tenant_s3: null };
     let filter = STATUSES.includes(location.hash.slice(1)) ? location.hash.slice(1) : null;
 
     function el(tag, attrs = {}, ...children) {
@@ -138,6 +143,17 @@ module.exports = `<!DOCTYPE html>
       }
     }
 
+    const TARGETS_KEY = 'cross_tenant_targets';
+
+    function readTargets() {
+      try {
+        const refs = JSON.parse(localStorage.getItem(TARGETS_KEY));
+        return Array.isArray(refs) ? refs.filter((ref) => typeof ref === 'string') : [];
+      } catch {
+        return [];
+      }
+    }
+
     function saveHints(targets) {
       try {
         const hints = readHints();
@@ -145,12 +161,35 @@ module.exports = `<!DOCTYPE html>
           if (t.jit_pooler && t.jit_pooler.pooler_host) hints[t.ref] = t.jit_pooler.pooler_host;
         }
         localStorage.setItem(HINTS_KEY, JSON.stringify(hints));
+        if (targets) localStorage.setItem(TARGETS_KEY, JSON.stringify(targets.map((t) => t.ref)));
       } catch {}
     }
 
     function hintsQuery() {
       const pairs = Object.entries(readHints()).map(([ref, host]) => ref + ':' + host);
       return pairs.length ? '?pooler_hints=' + encodeURIComponent(pairs.join(',')) : '';
+    }
+
+    const regionOfHost = (host) => (/^aws-\\d+-([a-z]{2}-[a-z]+-\\d+)\\.pooler\\./.exec(host || '') || [])[1];
+
+    // ref -> region, from the pooler hosts in the hints and in a /api/cross-tenant response.
+    function knownRegions(targets) {
+      const regions = {};
+      for (const [ref, host] of Object.entries(readHints())) {
+        const region = regionOfHost(host);
+        if (region) regions[ref] = region;
+      }
+      for (const t of targets || []) {
+        const region = t.jit_pooler && (t.jit_pooler.region || regionOfHost(t.jit_pooler.pooler_host));
+        if (region) regions[t.ref] = region;
+      }
+      return regions;
+    }
+
+    // Returns null when a target has no known region.
+    function regionsQuery(refs, regions) {
+      if (!refs.length || refs.some((ref) => !regions[ref])) return null;
+      return '?regions=' + encodeURIComponent(refs.map((ref) => ref + ':' + regions[ref]).join(','));
     }
 
     async function fetchJson(url, rawKey) {
@@ -182,9 +221,16 @@ module.exports = `<!DOCTYPE html>
       document.getElementById('summary').replaceChildren(...pills);
     }
 
+    // The S3 check goes after cross_tenant_storage, or at the end of the group.
+    function crossTenantGroup() {
+      const at = crossTenantResults.findIndex((r) => r.id === 'cross_tenant_storage');
+      if (at < 0) return [...crossTenantResults, ...s3Results];
+      return [...crossTenantResults.slice(0, at + 1), ...s3Results, ...crossTenantResults.slice(at + 1)];
+    }
+
     function update() {
       if (!diagnosticsResults) return;
-      results = [...diagnosticsResults, ...crossTenantResults];
+      results = [...diagnosticsResults, ...crossTenantGroup()];
       renderSummary();
       render();
     }
@@ -203,20 +249,51 @@ module.exports = `<!DOCTYPE html>
       }
     }
 
+    // Returns the targets of the response, or null when the call failed.
     async function loadCrossTenant() {
+      let targets = null;
       try {
         const { checks, data } = await fetchJson('/api/cross-tenant' + hintsQuery(), 'cross_tenant');
+        targets = (data.cross_tenant && data.cross_tenant.targets) || [];
         saveHints(data.cross_tenant && data.cross_tenant.targets);
         crossTenantResults = checks.results;
       } catch (err) {
         crossTenantResults = [{ ...CROSS_TENANT_PLACEHOLDER, status: 'warn', detail: 'Failed to load cross-tenant checks: ' + err.message }];
       }
       update();
+      return targets;
+    }
+
+    let s3Query = null;
+
+    // A later call replaces the result of an earlier one.
+    async function loadS3(query) {
+      s3Query = query;
+      try {
+        const { checks } = await fetchJson('/api/cross-tenant-s3' + query, 'cross_tenant_s3');
+        if (query === s3Query) s3Results = checks.results;
+      } catch (err) {
+        if (query === s3Query) s3Results = [{ ...S3_PLACEHOLDER, status: 'warn', detail: 'Failed to load the Storage S3 check: ' + err.message }];
+      }
+      update();
+    }
+
+    // The S3 check needs the region of each target. With a saved region for every saved target, it starts at
+    // once. Otherwise it waits for the pooler hosts that /api/cross-tenant finds.
+    async function loadCrossTenantGroup() {
+      const early = regionsQuery(readTargets(), knownRegions());
+      if (early) loadS3(early);
+      const targets = await loadCrossTenant();
+      const refs = targets ? targets.map((t) => t.ref) : readTargets();
+      const regions = knownRegions(targets);
+      const late = regionsQuery(refs, regions) ||
+        '?regions=' + encodeURIComponent(refs.filter((ref) => regions[ref]).map((ref) => ref + ':' + regions[ref]).join(','));
+      if (late !== early) loadS3(late);
     }
 
     function load() {
       loadDiagnostics();
-      loadCrossTenant();
+      loadCrossTenantGroup();
     }
 
     window.addEventListener('hashchange', () => {

@@ -40,6 +40,16 @@ function parsePoolerHints(spec) {
   return hints;
 }
 
+// "<ref>:<region>,<ref>:<region>". Only the regions in POOLER_REGIONS are kept.
+function parseRegionHints(spec) {
+  const regions = {};
+  for (const entry of (spec ?? '').split(',')) {
+    const [ref, region, ...extra] = entry.trim().split(':');
+    if (ref && !extra.length && PROJECT_REF_RE.test(ref) && POOLER_REGIONS.includes(region)) regions[ref] = region;
+  }
+  return regions;
+}
+
 const isAuthRejection = (r) => ['28P01', '28000'].includes(r?.code) || /password authentication failed/i.test(r?.error ?? '');
 const isNotFound = (r) => r?.code === 'ENOTFOUND' || /ENOTFOUND|tenant or user not found|tenant not found|user not found/i.test(r?.error ?? '');
 const isDefinitive = (r) => Boolean(r?.current_user) || isAuthRejection(r);
@@ -110,6 +120,7 @@ module.exports = {
   poolerRegion,
   candidateHosts,
   parsePoolerHints,
+  parseRegionHints,
   isAuthRejection,
   findTargetPooler,
   poolerHostCache,

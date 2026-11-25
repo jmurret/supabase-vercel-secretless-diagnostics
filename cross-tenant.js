@@ -3,7 +3,7 @@
 // passes and only the Bearer token decides.
 
 const { randomBytes } = require('node:crypto');
-const { findTargetPooler, isAuthRejection: isPoolerAuthRejection, poolerRegion, poolerHostCache } = require('./pooler-discovery');
+const { findTargetPooler, isAuthRejection: isPoolerAuthRejection, poolerRegion } = require('./pooler-discovery');
 const { signRequest, EMPTY_PAYLOAD_SHA256 } = require('./sigv4');
 const {
   GATEWAY_HEADER,
@@ -18,7 +18,6 @@ const {
 const PROBE_TIMEOUT_MS = 5000;
 const REALTIME_TIMEOUT_MS = 8000;
 const S3_PATH = '/storage/v1/s3/';
-const DEFAULT_S3_REGION = 'us-east-1';
 const S3_CREDENTIAL_CODES = ['SignatureDoesNotMatch', 'InvalidAccessKeyId', 'InvalidSignature'];
 const JIT_ROLE = 'postgres';
 const HEALTH_PATH = '/auth/v1/health';
@@ -64,6 +63,7 @@ const SERVICES = [
     expected: 'HTTP 401 or 403',
     isRejection: isAuthRejection,
     probe: probeS3,
+    regional: true,
   },
   // The websocket upgrade response headers are not visible to the client, so the gateway version cannot be
   // checked. A v2 request could not be told apart from a v1 request, so this probe sends only a v1 request.
@@ -265,9 +265,9 @@ async function probeService(deps, tenant, service) {
 
 const perVariant = (service, value) => (service.noGateway ? value : Object.fromEntries(VARIANTS.map((v) => [v, value])));
 
-async function probeAll(deps, tenant) {
-  const results = await Promise.all(SERVICES.map((s) => probeService(deps, tenant, s)));
-  return Object.fromEntries(SERVICES.map((s, i) => [s.id, results[i]]));
+async function probeAll(deps, tenant, services) {
+  const results = await Promise.all(services.map((s) => probeService(deps, tenant, s)));
+  return Object.fromEntries(services.map((s, i) => [s.id, results[i]]));
 }
 
 // A rejection from a project that does not exist, or that is in another environment, proves nothing.
@@ -311,6 +311,7 @@ async function probeJitPooler(jit, ref, secrets) {
     ...withError(error, secrets),
     ms,
     pooler_host: found.host,
+    region: poolerRegion(found.host),
     hosts_tried: found.tried,
     source: found.source,
   };
@@ -329,25 +330,7 @@ async function jitProbes(jit, ref) {
 
 const defaultCreateClient = (...args) => require('@supabase/supabase-js').createClient(...args);
 
-// The S3 signature needs the region of the project. The pooler host names it (aws-<n>-<region>.pooler...).
-// A target region is known only from a cached or hinted pooler host, because the pooler search runs at the same time.
-function pickRegion(candidates) {
-  const found = candidates.map(([source, host]) => ({ name: poolerRegion(host), source })).find((c) => c.name);
-  return found ?? { name: DEFAULT_S3_REGION, source: 'default' };
-}
-
-async function runCrossTenant({
-  spec,
-  ownUrl,
-  ownKey,
-  token,
-  jit,
-  ownPoolerHost = jit?.poolerHost,
-  fetchImpl = (...args) => fetch(...args),
-  createClientImpl = defaultCreateClient,
-  realtimeTimeoutMs,
-  now,
-}) {
+function notRunnable(spec, token, ownUrl) {
   if (!spec?.trim()) return { skipped: `CROSS_TENANT_TARGETS is not set. ${TARGETS_HINT}` };
   if (!token) return { skipped: 'No resource token was minted.' };
   try {
@@ -355,23 +338,35 @@ async function runCrossTenant({
   } catch {
     return { skipped: 'SUPABASE_URL is missing or invalid.' };
   }
+  return null;
+}
+
+const NO_KEY = { status: null, gateway_version: 'unknown', error: 'No publishable or anon key is set for this tenant.' };
+const noKeyResults = (services) => Object.fromEntries(services.map((s) => [s.id, perVariant(s, NO_KEY)]));
+
+// The regional services need the region of the target, so they run in runCrossTenantS3.
+const LOCAL_SERVICES = SERVICES.filter((s) => !s.regional);
+const REGIONAL_SERVICES = SERVICES.filter((s) => s.regional);
+
+async function runCrossTenant({
+  spec,
+  ownUrl,
+  ownKey,
+  token,
+  jit,
+  fetchImpl = (...args) => fetch(...args),
+  createClientImpl = defaultCreateClient,
+  realtimeTimeoutMs,
+}) {
+  const skipped = notRunnable(spec, token, ownUrl);
+  if (skipped) return skipped;
   const { own, targets, errors } = parseTargets(spec, ownUrl);
-  const noKey = { status: null, gateway_version: 'unknown', error: 'No publishable or anon key is set for this tenant.' };
-  const deps = { fetchImpl, createClientImpl, realtimeTimeoutMs, now };
-  const hostCache = jit?.poolerCache ?? poolerHostCache;
-  const ownRegion = pickRegion([['own_pooler_host', ownPoolerHost]]);
+  const deps = { fetchImpl, createClientImpl, realtimeTimeoutMs };
   const [control, ...probes] = await Promise.all([
-    ownKey
-      ? probeAll(deps, { ref: own.ref, url: own.url, key: ownKey, token, region: ownRegion, isControl: true })
-      : Object.fromEntries(SERVICES.map((s) => [s.id, perVariant(s, noKey)])),
+    ownKey ? probeAll(deps, { ref: own.ref, url: own.url, key: ownKey, token, isControl: true }, LOCAL_SERVICES) : noKeyResults(LOCAL_SERVICES),
     ...targets.map(async (t) => {
-      const region = pickRegion([
-        ['target_pooler_cache', hostCache.get(t.ref)],
-        ['target_pooler_hint', jit?.poolerHints?.[t.ref]],
-        ['own_pooler_host', ownPoolerHost],
-      ]);
       const [targetProbes, health, jitResults] = await Promise.all([
-        probeAll(deps, { ref: t.ref, url: t.url, key: t.key, token, region }),
+        probeAll(deps, { ref: t.ref, url: t.url, key: t.key, token }, LOCAL_SERVICES),
         probeHealth(fetchImpl, t.url, t.key),
         jitProbes(jit, t.ref),
       ]);
@@ -382,6 +377,47 @@ async function runCrossTenant({
     own: { ...own, control },
     targets: targets.map((t, i) => ({ ref: t.ref, url: t.url, probes: probes[i].probes, health: probes[i].health, ...probes[i].jitResults })),
     errors,
+  };
+}
+
+const TARGET_REGION_UNKNOWN = 'target region unknown';
+const OWN_REGION_UNKNOWN = 'the region of this tenant is unknown: POSTGRES_POOLER_HOST does not name one';
+const regionalResults = (result) => Object.fromEntries(REGIONAL_SERVICES.map((s) => [s.id, perVariant(s, result)]));
+
+// The S3 signature needs the region of the project. regions is { <target ref>: <region> }, from the dashboard,
+// which reads it from the pooler host that /api/cross-tenant found. The control region comes from
+// POSTGRES_POOLER_HOST (aws-<n>-<region>.pooler...). A target without a region is not probed.
+async function runCrossTenantS3({ spec, ownUrl, ownKey, token, ownPoolerHost, regions = {}, fetchImpl = (...args) => fetch(...args), now }) {
+  const skipped = notRunnable(spec, token, ownUrl);
+  if (skipped) return skipped;
+  const { own, targets, errors } = parseTargets(spec, ownUrl);
+  const deps = { fetchImpl, now };
+  const ownRegion = poolerRegion(ownPoolerHost);
+  const control = !ownKey
+    ? noKeyResults(REGIONAL_SERVICES)
+    : ownRegion
+      ? probeAll(deps, { ref: own.ref, url: own.url, key: ownKey, token, region: { name: ownRegion, source: 'own_pooler_host' }, isControl: true }, REGIONAL_SERVICES)
+      : regionalResults({ status: null, gateway_version: 'unknown', error: OWN_REGION_UNKNOWN });
+  const [controlResults, ...probes] = await Promise.all([
+    control,
+    ...targets.map(async (t) => {
+      const region = regions[t.ref];
+      const [targetProbes, health] = await Promise.all([
+        region
+          ? probeAll(deps, { ref: t.ref, url: t.url, key: t.key, token, region: { name: region, source: 'regions' } }, REGIONAL_SERVICES)
+          : regionalResults({ status: null, gateway_version: 'unknown', unprobed: TARGET_REGION_UNKNOWN }),
+        probeHealth(fetchImpl, t.url, t.key),
+      ]);
+      return { probes: targetProbes, health };
+    }),
+  ]);
+  const known = new Set(targets.map((t) => t.ref));
+  const ignored = Object.keys(regions).filter((ref) => !known.has(ref));
+  return {
+    own: { ...own, region: ownRegion, control: controlResults },
+    targets: targets.map((t, i) => ({ ref: t.ref, url: t.url, region: regions[t.ref] ?? null, ...probes[i] })),
+    errors,
+    ...(ignored.length && { ignored_regions: ignored }),
   };
 }
 
@@ -419,6 +455,7 @@ function classifyRealtime(service, control, target, health) {
 
 function classify(service, control, target, health) {
   if (service.classify) return service.classify(service, control, target, health);
+  if (target?.unprobed) return { result: 'inconclusive', reason: target.unprobed };
   const s = target?.status ?? null;
   if (is2xx(s)) return { result: 'accepted' };
   if (service.id === 'rest' && s === 404 && /PGRST205/.test(target?.error ?? '')) {
@@ -615,8 +652,9 @@ function evaluateJitProbe(data, jit, probe) {
 
 // For each target, the gateway versions that answered the v1 requests and the v2 requests. A target is
 // covered when every v1 request was served by api-gateway v1 and every v2 request by api-gateway v2.
+// The regional services run in another request, so they are not part of it.
 function gatewayCoverage(data) {
-  const services = SERVICES.filter((s) => !s.noGateway);
+  const services = LOCAL_SERVICES.filter((s) => !s.noGateway);
   return data.targets.map((t) => {
     const seen = Object.fromEntries(
       VARIANTS.map((v) => [v, [...new Set(services.map((s) => t.probes[s.id]?.[v]?.gateway_version).filter(Boolean))].sort()])
@@ -632,6 +670,7 @@ module.exports = {
   normalizeGatewayVersion,
   parseTargets,
   runCrossTenant,
+  runCrossTenantS3,
   evaluateService,
   describeVariants,
   evaluateJitProbe,

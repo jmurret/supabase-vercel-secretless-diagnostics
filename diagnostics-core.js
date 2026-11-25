@@ -3,8 +3,8 @@ const { getVercelOidcToken } = require('@vercel/functions/oidc');
 const { Client } = require('pg');
 const { runChecks } = require('./checks');
 const { poolerLoginParams } = require('./pooler');
-const { runCrossTenant } = require('./cross-tenant');
-const { parsePoolerHints } = require('./pooler-discovery');
+const { runCrossTenant, runCrossTenantS3 } = require('./cross-tenant');
+const { parsePoolerHints, parseRegionHints } = require('./pooler-discovery');
 
 const URL_ENV_VAR = ['SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_URL'].find((n) => process.env[n]);
 const SUPABASE_URL = URL_ENV_VAR ? process.env[URL_ENV_VAR].replace(/\/+$/, '') : undefined;
@@ -280,7 +280,6 @@ function runCrossTenantProbes(req, server, jit) {
     ownUrl: SUPABASE_URL,
     ownKey: server.ctx?.apikey,
     token: server.ctx?.resourceToken,
-    ownPoolerHost: process.env.POSTGRES_POOLER_HOST,
     jit: jitToken
       ? {
           token: jitToken,
@@ -305,7 +304,25 @@ async function runCrossTenantDiagnostics(req) {
     runCrossTenantProbes(req, server, jit),
   ]);
   const data = { cross_tenant: crossTenant, jit: { management_api: jitApi, postgres_login: jitLogin } };
-  const checks = await runChecks(data, server.ctx, { include: ['cross_tenant'] });
+  const checks = await runChecks(data, server.ctx, { include: ['cross_tenant'], exclude: [S3_CHECK_ID] });
+  return { data, checks };
+}
+
+const S3_CHECK_ID = 'cross_tenant_storage_s3';
+
+// Runs the Storage S3 probes with the target regions from ?regions=<ref>:<region>,...
+async function runCrossTenantS3Diagnostics(req) {
+  const server = await resolveServerCredential(req);
+  const crossTenantS3 = await runCrossTenantS3({
+    spec: process.env.CROSS_TENANT_TARGETS,
+    ownUrl: SUPABASE_URL,
+    ownKey: server.ctx?.apikey,
+    token: server.ctx?.resourceToken,
+    ownPoolerHost: process.env.POSTGRES_POOLER_HOST,
+    regions: parseRegionHints(new URL(req.url ?? '/', 'http://localhost').searchParams.get('regions')),
+  });
+  const data = { cross_tenant_s3: crossTenantS3 };
+  const checks = await runChecks(data, server.ctx, { include: [S3_CHECK_ID] });
   return { data, checks };
 }
 
@@ -347,5 +364,6 @@ module.exports = {
   loginPooler,
   noJitTokenResult,
   runCrossTenantDiagnostics,
+  runCrossTenantS3Diagnostics,
   serve,
 };

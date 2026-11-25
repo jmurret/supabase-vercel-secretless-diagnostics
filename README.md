@@ -29,6 +29,15 @@ response arrives, with a dashed gray "Loading…" row for the `cross_tenant` gro
 (the dashboard sends the saved pooler hints), it replaces the row with the `cross_tenant` checks and updates the
 summary pills. If that call fails, the row shows a warning with the error message.
 
+The `cross_tenant_storage_s3` check needs the region of each target, so it has its own endpoint,
+`/api/cross-tenant-s3`. Until it answers, the dashboard shows the row "Loading… (waiting for target region)".
+The dashboard keeps the target refs of the last `/api/cross-tenant` response and the pooler hosts in
+`localStorage`. If these give a region for every target, the dashboard calls `/api/cross-tenant-s3` at the same
+time as the other endpoints. Otherwise, it waits for `/api/cross-tenant`, takes the region of each target from the
+pooler host that it found, and then calls `/api/cross-tenant-s3`. If the targets in the response have regions that
+the first call did not send, the dashboard calls it again, and the last call gives the row. The S3 check goes in the
+`cross_tenant` group, and the summary pills count it. If the call fails, the row shows a warning with the error message.
+
 ## `GET /api/diagnostics`
 
 Handled by [`api/diagnostics.js`](./api/diagnostics.js) (a `(req, res)` handler used by `server.js` locally
@@ -105,7 +114,8 @@ with `PGRST301` ("No suitable key or wrong key type").
 Each result is `pass`, `warn`, `fail` or `skip` (skipped because an earlier step failed
 or the runtime cannot run the check). `summary.status` is the worst of `fail`, `warn` and `pass`.
 `skip` results do not change `summary.status`. `/api/diagnostics` runs all groups except `cross_tenant`.
-`/api/cross-tenant` runs only `cross_tenant`. The `summary` of each response covers only its own checks.
+`/api/cross-tenant` runs the `cross_tenant` group without `cross_tenant_storage_s3`. `/api/cross-tenant-s3` runs only
+`cross_tenant_storage_s3`. The `summary` of each response covers only its own checks.
 
 | Group | Checks |
 |---|---|
@@ -157,9 +167,19 @@ The response is `{ "data": {...}, "checks": {...} }`:
 
 - `data.cross_tenant` has the results of the cross-tenant probes and of the control probes on this project. Keys and tokens are not included, and a `2xx` response body is not kept.
 - `data.jit` has `management_api` and `postgres_login`, the two JIT results that the cross-tenant checks use as controls.
-- `checks` has only the `cross_tenant` group. `checks.summary` counts only these checks.
+- `checks` has the `cross_tenant` group without `cross_tenant_storage_s3`. `checks.summary` counts only these checks.
 
 The query parameter `pooler_hints` is a list of `<target ref>:<pooler host>` entries, separated by commas. The pooler check tries these hosts first. The dashboard saves the hosts that answered and sends them on the next load.
+
+For each target, `data.cross_tenant.targets[].jit_pooler` has the pooler host that answered (`pooler_host`) and its region (`region`, from `aws-<n>-<region>.pooler...`). The dashboard sends this region to `/api/cross-tenant-s3`.
+
+### `GET /api/cross-tenant-s3`
+
+Handled by [`api/cross-tenant-s3.js`](./api/cross-tenant-s3.js), with the same handler style. It runs only the `cross_tenant_storage_s3` probes, because the SigV4 signature needs the region of the target, and the region is known only after the pooler search of `/api/cross-tenant`.
+
+The query parameter `regions` is a list of `<target ref>:<region>` entries, separated by commas, for example `?regions=zyxwvutsrqponmlkjihg:eu-west-2`. The endpoint keeps only the regions in the list of Supabase AWS regions (`POOLER_REGIONS` in [`pooler-discovery.js`](./pooler-discovery.js)) and only well-formed refs. A region for a ref that is not in `CROSS_TENANT_TARGETS` is not used, and `data.cross_tenant_s3.ignored_regions` lists the ref. A target without a valid region is not probed: its result is inconclusive with the reason `target region unknown`. The endpoint does not guess a region. The control on this tenant uses the region of `POSTGRES_POOLER_HOST`. If that host does not name a region, the control is not sent and the results are inconclusive.
+
+The response is `{ "data": { "cross_tenant_s3": {...} }, "checks": {...} }`. `checks` has only `cross_tenant_storage_s3` (group `cross_tenant`). `data.cross_tenant_s3` has the same form as `data.cross_tenant`, with the region of each target (`targets[].region`) and of this tenant (`own.region`). The endpoint also sends `GET /auth/v1/health` to each target.
 
 The probes are:
 
@@ -177,7 +197,7 @@ Two more checks use the default-role token in a different way. They show the sam
 | `cross_tenant_storage_s3` | `GET /storage/v1/s3/` (S3 `ListBuckets`, path style) signed with AWS SigV4. The access key id is the target ref. The secret access key is the target key. The token is the session token (`x-amz-security-token`). | `401` or `403` with an S3 error, such as `AccessDenied`. The S3 error code is in the result. `InvalidAccessKeyId`, `SignatureDoesNotMatch` and `InvalidSignature` give a warning, because the target rejected the key or signature before it checked the token. A `2xx` response fails the check. |
 | `cross_tenant_realtime_ws` | Websocket join of a private channel `vercel-oidc-xtenant-<random>` with `@supabase/supabase-js`. The client uses the target key, and `realtime.setAuth` sets the token. | `CHANNEL_ERROR`. The error message is in the result. `SUBSCRIBED` fails the check. No answer in 8 seconds (`TIMED_OUT`) is inconclusive. |
 
-For `cross_tenant_storage_s3`, the signature uses the region of the project. The check takes it from the pooler host (`aws-<n>-<region>.pooler...`): for a target, from the cached or hinted pooler host, otherwise from `POSTGRES_POOLER_HOST` of this deployment. If no host names a region, it uses `us-east-1`. The result shows the `region` and where it came from (`region_source`). The pooler search runs at the same time, so a target region is known only after an earlier run or from `pooler_hints`. The control uses the same request on this tenant. If it fails with a signature or key error and the key is a publishable key, the control error says that Storage S3 may accept only the legacy anon key as the secret.
+For `cross_tenant_storage_s3`, the signature uses the region of the project. The target region comes from the `regions` query parameter of [`/api/cross-tenant-s3`](#get-apicross-tenant-s3) (`region_source` `regions`). The control region comes from `POSTGRES_POOLER_HOST` (`control_region_source` `own_pooler_host`). Without a target region, the result is inconclusive (`target region unknown`). The control uses the same request on this tenant. If it fails with a signature or key error and the key is a publishable key, the control error says that Storage S3 may accept only the legacy anon key as the secret.
 
 For `cross_tenant_realtime_ws`, the control joins a private channel on this tenant. It can fail with `CHANNEL_ERROR` if this project has no policy on `realtime.messages` for the token. The control error shows the message.
 
@@ -215,7 +235,7 @@ Each check shows, for each target: the target ref, the gateway version, the cont
 - Each target also gets `GET /auth/v1/health` with its key as `apikey`. If this is not `2xx`, the target ref or key is not valid in this environment (wrong ref, wrong key, paused project, or a project in the other environment, such as a staging project on a production deployment). A rejection from such a target proves nothing, so the result for that target is inconclusive and the check warns. A `2xx` response to the token is still a regression.
 - The same probes go to this deployment's own project (own URL and own publishable or anon key) as a positive control. If the control does not return `2xx` for a service, this tenant does not accept the token for that service either, so a rejection by a target proves nothing. The result for that service is inconclusive and the check warns. The REST probe reads the `public.countries` table, which this project creates in its migrations. Auth admin can be inconclusive if Supabase Auth does not accept resource tokens on this tenant. The control error, such as `PGRST301: ...`, shows why.
 
-The gateway version comes from the `sb-gateway-version` response header. The values `1` and `1.0` become `v1`, and `2` and `2.0` become `v2`. If the header is missing, the version is `unknown`. `cross_tenant_gateway_coverage` passes when, for each target, every `v1` request was answered by `v1` and every `v2` request was answered by `v2`. Otherwise it warns and names the targets and the gateways that answered, for example `<ref>: v2 requests were answered by v1`. `actual` has, for each target, the versions that answered the `v1` and the `v2` requests, and `missing` (the variants that did not reach their gateway).
+The gateway version comes from the `sb-gateway-version` response header. The values `1` and `1.0` become `v1`, and `2` and `2.0` become `v2`. If the header is missing, the version is `unknown`. `cross_tenant_gateway_coverage` passes when, for each target, every `v1` request was answered by `v1` and every `v2` request was answered by `v2`. Otherwise it warns and names the targets and the gateways that answered, for example `<ref>: v2 requests were answered by v1`. It uses the requests of `/api/cross-tenant`, so `cross_tenant_storage_s3` is not part of it. `actual` has, for each target, the versions that answered the `v1` and the `v2` requests, and `missing` (the variants that did not reach their gateway).
 
 Vercel mints resource tokens only for teams on an allow list. Tenant A (this deployment's Vercel team) must be on an allow-listed team, or no token is minted and the cross-tenant checks are skipped.
 

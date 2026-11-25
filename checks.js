@@ -132,6 +132,7 @@ function buildContext(data, ctx, env, nowMs) {
     controls: sc.controls ?? null,
     jit: data.jit ?? null,
     crossTenant: data.cross_tenant ?? null,
+    crossTenantS3: data.cross_tenant_s3 ?? null,
   };
 }
 
@@ -160,14 +161,13 @@ const CTRL_2151_HINT = 'Known issue CTRL-2151: the pooler needs `--jit=true`.';
 const JIT_ROLE_MISMATCH = 'Token role does not match requested role';
 const JIT_ROLE_HINT = `The token role must equal the requested JIT role. Mint the token with ?role=${JIT_ROLE}.`;
 const jitApiHint = (r) => (r.status === 403 && r.error?.includes(JIT_ROLE_MISMATCH) ? JIT_ROLE_HINT : JIT_HINT);
-const needCrossTenant = (c) => {
-  const ct = c.crossTenant;
+const needCrossTenant = (c, ct = c.crossTenant) => {
   if (!ct) return skip('Cross-tenant probes were not run.');
   if (ct.skipped) return skip(ct.skipped);
   return null;
 };
-const needCrossTenantTargets = (c) =>
-  needCrossTenant(c) || (c.crossTenant.targets.length ? null : skip('No valid cross-tenant targets; see cross_tenant_targets.'));
+const needCrossTenantTargets = (c, ct = c.crossTenant) =>
+  needCrossTenant(c, ct) || (ct.targets.length ? null : skip('No valid cross-tenant targets; see cross_tenant_targets.'));
 
 function crossTenantServiceCheck(service) {
   const onGateways = service.noGateway ? '' : ' on api-gateway v1 and v2';
@@ -176,11 +176,12 @@ function crossTenantServiceCheck(service) {
     group: 'cross_tenant',
     description: `${service.label} on other tenants rejects this tenant's default-role resource token${onGateways} (${service.request ?? `${service.method} ${service.path}`})`,
     run: (c) => {
-      const s = needCrossTenantTargets(c);
+      const ct = service.regional ? c.crossTenantS3 : c.crossTenant;
+      const s = needCrossTenantTargets(c, ct);
       if (s) return s;
-      const { rows, accepted, inconclusive } = evaluateService(c.crossTenant, service);
+      const { rows, accepted, inconclusive } = evaluateService(ct, service);
       const expected = `${service.expected} from every target${onGateways}`;
-      const ownRef = c.crossTenant.own.ref;
+      const ownRef = ct.own.ref;
       if (service.noGateway) {
         if (accepted.length) {
           return fail(expected, rows, accepted
@@ -853,11 +854,12 @@ const CHECKS = [
   },
 ];
 
-// include and exclude are lists of group names. The summary covers only the checks that ran.
+// include and exclude are lists of group names and check ids. The summary covers only the checks that ran.
 async function runChecks(data, ctx, { env = process.env, now = Date.now, fetchImpl = fetch, include, exclude } = {}) {
   const c = buildContext(data, ctx, env, now());
   const results = [];
-  const selected = CHECKS.filter((check) => (!include || include.includes(check.group)) && !exclude?.includes(check.group));
+  const matches = (list, check) => list.includes(check.group) || list.includes(check.id);
+  const selected = CHECKS.filter((check) => (!include || matches(include, check)) && !(exclude && matches(exclude, check)));
   for (const check of selected) {
     let outcome;
     try {
